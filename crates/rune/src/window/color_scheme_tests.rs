@@ -47,14 +47,20 @@ fn per_window_override_takes_precedence_over_app_scheme_while_system_inherits() 
 fn platform_resolution_lets_macos_inherit_nsapp_and_resolves_fallback_elsewhere() {
     for app in [ColorScheme::System, ColorScheme::Light, ColorScheme::Dark] {
         // On macOS, a System window keeps NSWindow.appearance == nil so it inherits NSApp.appearance.
-        assert_eq!(window_theme_for_platform(ColorScheme::System, app, true), None);
-        assert_eq!(window_theme_for_platform(ColorScheme::Light, app, true), Some(Theme::Light));
-        assert_eq!(window_theme_for_platform(ColorScheme::Dark, app, true), Some(Theme::Dark));
+        assert_eq!(resolved_window_theme(ColorScheme::System, app, true, None), None);
+        assert_eq!(resolved_window_theme(ColorScheme::Light, app, true, None), Some(Theme::Light));
+        assert_eq!(resolved_window_theme(ColorScheme::Dark, app, true, None), Some(Theme::Dark));
 
-        // On Windows and Linux, a System window resolves directly to the app-wide scheme.
-        assert_eq!(window_theme_for_platform(ColorScheme::System, app, false), app.winit_theme());
-        assert_eq!(window_theme_for_platform(ColorScheme::Light, app, false), Some(Theme::Light));
-        assert_eq!(window_theme_for_platform(ColorScheme::Dark, app, false), Some(Theme::Dark));
+        // On Windows, a System window resolves directly to the app-wide scheme.
+        assert_eq!(resolved_window_theme(ColorScheme::System, app, false, None), app.winit_theme());
+        assert_eq!(resolved_window_theme(ColorScheme::Light, app, false, None), Some(Theme::Light));
+        assert_eq!(resolved_window_theme(ColorScheme::Dark, app, false, None), Some(Theme::Dark));
+
+        // On Linux, the desktop's light or dark resolves System; an explicit scheme ignores it.
+        assert_eq!(resolved_window_theme(ColorScheme::System, app, false, Some(true)), Some(Theme::Dark));
+        assert_eq!(resolved_window_theme(ColorScheme::System, app, false, Some(false)), Some(Theme::Light));
+        assert_eq!(resolved_window_theme(ColorScheme::Light, app, false, Some(true)), Some(Theme::Light));
+        assert_eq!(resolved_window_theme(ColorScheme::Dark, app, false, Some(false)), Some(Theme::Dark));
     }
 }
 
@@ -68,7 +74,7 @@ fn fake_window_sink_applies_only_on_change_and_retains_across_recreation() {
     }
     impl FakeHost {
         fn create(&mut self, app_scheme: ColorScheme, is_macos: bool) -> Option<Theme> {
-            let theme = window_theme_for_platform(self.window_scheme, app_scheme, is_macos);
+            let theme = resolved_window_theme(self.window_scheme, app_scheme, is_macos, None);
             self.applied = theme;
             self.live = true;
             theme
@@ -78,7 +84,7 @@ fn fake_window_sink_applies_only_on_change_and_retains_across_recreation() {
         }
         fn sync(&mut self, app_scheme: ColorScheme, is_macos: bool) {
             if !self.live { return; }
-            let target = window_theme_for_platform(self.window_scheme, app_scheme, is_macos);
+            let target = resolved_window_theme(self.window_scheme, app_scheme, is_macos, None);
             let log = &mut self.applied_log;
             sync_window_theme(&mut self.applied, target, |t| log.push(t));
         }
