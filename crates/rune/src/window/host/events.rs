@@ -831,9 +831,19 @@ impl Host {
                 rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
                 rt.double_click_interval = crate::platform::preferences::double_click_interval();
             }
+            #[cfg(target_os = "linux")]
+            if self.args.theme.is_none() && let Some(dark) = crate::platform::preferences::dark() {
+                rt.set_system_dark(dark);
+            }
+            #[cfg(not(target_os = "linux"))]
             if self.args.theme.is_none() && let Some(dark) = self.win.as_ref().and_then(|l| crate::platform::preferences::desktop_dark(&l.window)) {
                 rt.set_system_dark(dark);
             }
+        }
+        // The desktop's answer is newer than the last run's: the CSD frame follows it too.
+        #[cfg(all(target_os = "linux", feature = "dbus"))]
+        if self.args.theme.is_none() {
+            self.apply_window_color_scheme();
         }
         #[cfg(target_os = "macos")]
         if self.win.as_ref().is_some_and(|l| l.native.full_screen.take()) {
