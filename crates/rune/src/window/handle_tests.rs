@@ -16,6 +16,19 @@ fn an_unbound_handle_queues_its_requests_for_the_host_or_a_headless_run() {
     assert!(matches!(handle.take_headless()[..], [WakeEvent::Window(0, WindowRequest::Hide)]));
 }
 
+/// A click's activation token rides the window's open, so Wayland lets it take focus.
+#[test]
+fn activate_queues_an_open_with_the_token() {
+    let handle = WindowHandle::new("click");
+    handle.activate("token");
+    assert!(matches!(
+        handle.take_headless()[..],
+        [WakeEvent::Window(0, WindowRequest::Open(Some(ref t)))] if t == "token"
+    ));
+    handle.activate("");
+    assert!(matches!(handle.take_headless()[..], [WakeEvent::Window(0, WindowRequest::Open(None))]));
+}
+
 /// `hide_now` with no native window still asks the host to hide, as `hide` does.
 #[test]
 fn hide_now_queues_the_hosts_hide() {
