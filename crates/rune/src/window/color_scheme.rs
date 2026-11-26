@@ -118,20 +118,47 @@ pub(crate) fn set_app_color_scheme_state(scheme: ColorScheme) {
 ///
 /// On macOS, AppKit natively inherits `NSApplication.appearance` for any window whose own
 /// `NSWindow.appearance` is `nil`, so `ColorScheme::System` maps to `None` regardless of
-/// `app`. On Windows and Linux there is no process-wide appearance property, so a window
-/// set to `ColorScheme::System` falls back to `app`.
+/// `app`. On Windows there is no process-wide appearance property, so a window set to
+/// `ColorScheme::System` falls back to `app`. On Linux the desktop's own answer decides a
+/// `System` window (see [`platform_dark`]): winit would leave it to sctk-adwaita, which reads
+/// the preference with `dbus-send` and draws a light frame around a dark app when that tool is
+/// not installed.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) const fn window_theme_for_platform(
+pub(crate) fn window_theme_for_platform(
     window: ColorScheme,
     app: ColorScheme,
     is_macos: bool,
 ) -> Option<winit::window::Theme> {
+    resolved_window_theme(window, app, is_macos, platform_dark())
+}
+
+/// [`window_theme_for_platform`] with the desktop's light or dark handed in: `Some` for its
+/// answer (or the app's dark fallback), `None` where winit's own theme stands.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolved_window_theme(
+    window: ColorScheme,
+    app: ColorScheme,
+    is_macos: bool,
+    system_dark: Option<bool>,
+) -> Option<winit::window::Theme> {
     if is_macos {
         window.winit_theme()
     } else {
-        window.effective_for_window(app).winit_theme()
+        match window.effective_for_window(app) {
+            ColorScheme::System => system_dark.map(|dark| if dark { winit::window::Theme::Dark } else { winit::window::Theme::Light }),
+            explicit => explicit.winit_theme(),
+        }
     }
 }
+
+/// The desktop's light or dark where the app already reads it for `Cx::system_dark`: Linux's
+/// XDG desktop portal, seeded with the last run's answer. No answer keeps the app's dark
+/// fallback, so the frame and the content agree.
+#[cfg(all(target_os = "linux", feature = "dbus"))]
+fn platform_dark() -> Option<bool> { Some(crate::platform::preferences::dark().unwrap_or(true)) }
+
+#[cfg(not(all(target_os = "linux", feature = "dbus")))]
+fn platform_dark() -> Option<bool> { None }
 
 /// Deduplicating tracker for applying a window's effective winit theme only when it changes.
 /// Used by native hosts and unit-tested behind a fake sink.
