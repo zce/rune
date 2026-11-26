@@ -290,6 +290,14 @@ impl WindowHandle {
     }
     /// Focus/activate an already-visible window, restoring it if minimized. Wayland requests attention.
     pub fn focus(&self) { self.send(WakeEvent::Focus); }
+    /// Show, restore and activate with a token another process forwarded (`XDG_ACTIVATION_TOKEN`
+    /// on Wayland, `DESKTOP_STARTUP_ID` on X11), so the compositor lets it take focus, as
+    /// [`crate::AppHandle::activate`] does for the app's window. Where tokens don't exist this is
+    /// [`open`](Self::open).
+    pub fn activate(&self, token: impl Into<String>) {
+        let token = token.into();
+        self.send(move |slot| WakeEvent::Window(slot, WindowRequest::Open(Some(token).filter(|t| !t.is_empty()))));
+    }
     /// Show, restore and activate, creating the window if needed (see `AppHandle::open`).
     /// A default close destroys its host; use App::keep_running to reopen.
     /// Windows added with `App::window` always reopen. Requests made before the loop runs
