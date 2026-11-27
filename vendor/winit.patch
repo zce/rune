@@ -1,31 +1,10 @@
-diff --git a/src/platform_impl/linux/wayland/seat/pointer/mod.rs b/src/platform_impl/linux/wayland/seat/pointer/mod.rs
---- a/src/platform_impl/linux/wayland/seat/pointer/mod.rs
-+++ b/src/platform_impl/linux/wayland/seat/pointer/mod.rs
-@@ -171,3 +171,3 @@
-                 },
--                PointerEventKind::Axis { horizontal, vertical, .. } => {
-+                PointerEventKind::Axis { horizontal, vertical, source, .. } => {
-                     // Get the current phase.
-@@ -204,5 +204,14 @@
-                     } else {
-                         // NOTE: Wayland sign convention is the inverse of winit.
-+                        use sctk::reexports::client::protocol::wl_pointer::AxisSource;
-+                        // Chromium 152, wayland_pointer.cc: OnAxis converts surface units by
-+                        // kWheelDelta / kAxisValueScale. Only finger and continuous sources use
-+                        // this gain here: a wheel can send axis-only frames between detents.
-+                        const FINGER_POINTS_PER_AXIS_UNIT: f64 = 120.0 / 10.0;
-+                        let gain = match source {
-+                            Some(AxisSource::Finger | AxisSource::Continuous) => FINGER_POINTS_PER_AXIS_UNIT,
-+                            _ => 1.0,
-+                        };
-                         MouseScrollDelta::PixelDelta(
--                            LogicalPosition::new(-horizontal.absolute, -vertical.absolute)
-+                            LogicalPosition::new(-horizontal.absolute * gain, -vertical.absolute * gain)
-                                 .to_physical(scale_factor),
 diff --git a/src/platform/macos.rs b/src/platform/macos.rs
+index 30623b01e..b34708fbd 100644
 --- a/src/platform/macos.rs
 +++ b/src/platform/macos.rs
-@@ -435,2 +435,10 @@ pub trait EventLoopBuilderExtMacOS {
+@@ -433,9 +433,23 @@ pub trait EventLoopBuilderExtMacOS {
+     ///
+     /// The default behavior is to ignore other applications and activate when launched.
      fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self;
 +
 +    /// Whether a bundled app with no activation policy of its own gets `NewEvents(Init)` and
@@ -36,7 +15,7 @@ diff --git a/src/platform/macos.rs b/src/platform/macos.rs
 +    /// Off by default.
 +    fn with_init_before_finish_launching(&mut self, early: bool) -> &mut Self;
  }
-@@ -438,2 +446,8 @@ pub trait EventLoopBuilderExtMacOS {
+ 
  impl<T> EventLoopBuilderExtMacOS for EventLoopBuilder<T> {
 +    #[inline]
 +    fn with_init_before_finish_launching(&mut self, early: bool) -> &mut Self {
@@ -45,7 +24,11 @@ diff --git a/src/platform/macos.rs b/src/platform/macos.rs
 +    }
 +
      #[inline]
-@@ -531 +545,32 @@ pub enum OptionAsAlt {
+     fn with_activation_policy(&mut self, activation_policy: ActivationPolicy) -> &mut Self {
+         self.platform_specific.activation_policy = Some(activation_policy);
+@@ -529,3 +543,34 @@ pub enum OptionAsAlt {
+     #[default]
+     None,
  }
 +
 +/// Rune: the default menu `with_default_menu` installs before the init events, for an app that
@@ -78,9 +61,1368 @@ diff --git a/src/platform/macos.rs b/src/platform/macos.rs
 +pub fn take_ime_replacement() -> Option<std::ops::Range<usize>> {
 +    crate::platform_impl::ime_text::REPLACEMENT.with_borrow_mut(|r| r.take())
 +}
+diff --git a/src/platform/wayland.rs b/src/platform/wayland.rs
+index 9c1a8e437..7be1df99a 100644
+--- a/src/platform/wayland.rs
++++ b/src/platform/wayland.rs
+@@ -27,6 +27,12 @@ pub use crate::window::Theme;
+ pub trait ActiveEventLoopExtWayland {
+     /// True if the [`ActiveEventLoop`] uses Wayland.
+     fn is_wayland(&self) -> bool;
++
++    /// Rune: when `wake` is true, any successful Wayland display read marks the event loop as
++    /// having dispatched events so `ControlFlow::Wait` runs a turn even when winit's own queues
++    /// had no events. Foreign Wayland queues sharing the display (such as layer-shell overlays)
++    /// dispatch on that turn without background reader threads. Off by default; no-op on X11.
++    fn set_wake_on_wayland_read(&self, wake: bool);
+ }
+ 
+ impl ActiveEventLoopExtWayland for ActiveEventLoop {
+@@ -34,6 +40,11 @@ impl ActiveEventLoopExtWayland for ActiveEventLoop {
+     fn is_wayland(&self) -> bool {
+         self.p.is_wayland()
+     }
++
++    #[inline]
++    fn set_wake_on_wayland_read(&self, wake: bool) {
++        self.p.set_wake_on_wayland_read(wake);
++    }
+ }
+ 
+ /// Additional methods on [`EventLoop`] that are specific to Wayland.
+@@ -81,6 +92,39 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
+ pub trait WindowExtWayland {
+     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
+     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
++
++    /// Rune: the radius, in logical points, of the arc the window's content takes at its bottom
++    /// corners. A client-side frame (`sctk-adwaita`) draws a one-point border around the window
++    /// and rounds its corners while it floats, so the content's own square corners would show
++    /// past it.
++    ///
++    /// Zero when the frame draws the window square (maximized or tiled), when no client-side
++    /// frame is drawn (server side decorations, or decorations off), and on X11.
++    fn content_corner_radius(&self) -> f32;
++
++    /// Rune: whether a client-side frame draws the window's decorations, true whatever state the
++    /// frame is in: a maximized, tiled or fullscreen window keeps its frame, which hides parts of
++    /// itself rather than going away.
++    ///
++    /// False when the compositor draws the decorations, when decorations are off, when no frame
++    /// could be made, and on X11.
++    fn has_client_side_frame(&self) -> bool;
++
++    /// Rune: whether a client-side frame without a header bar draws around the window
++    /// (`WindowAttributesExtWayland::with_headerless_frame`), whatever state it is in: the
++    /// content then takes the arc of `content_corner_radius` at its top corners as well as its
++    /// bottom ones, and the frame's handles, outside the window's edges, resize it.
++    ///
++    /// False when the compositor draws the decorations all the same, when decorations are off,
++    /// when no frame could be made, and on X11.
++    fn has_headerless_frame(&self) -> bool;
++
++    /// Rune: confirmed Wayland `xdg_toplevel` / `xdg-decoration` state from the latest configure:
++    /// `(is_server_decoration, tiled_edges [top, right, bottom, left], wm_capabilities bits)`.
++    ///
++    /// Returns `None` before the initial configure and on X11. `tiled_edges` is `None` below
++    /// `xdg_toplevel` v2 and `wm_capabilities` is `None` below v5.
++    fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)>;
+ }
+ 
+ impl WindowExtWayland for Window {
+@@ -94,6 +138,51 @@ impl WindowExtWayland for Window {
+             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
+         }
+     }
++
++    #[inline]
++    fn content_corner_radius(&self) -> f32 {
++        #[allow(clippy::single_match)]
++        match &self.window {
++            #[cfg(x11_platform)]
++            crate::platform_impl::Window::X(_) => 0.,
++            #[cfg(wayland_platform)]
++            crate::platform_impl::Window::Wayland(window) => window.content_corner_radius(),
++        }
++    }
++
++    #[inline]
++    fn has_client_side_frame(&self) -> bool {
++        #[allow(clippy::single_match)]
++        match &self.window {
++            #[cfg(x11_platform)]
++            crate::platform_impl::Window::X(_) => false,
++            #[cfg(wayland_platform)]
++            crate::platform_impl::Window::Wayland(window) => window.has_client_side_frame(),
++        }
++    }
++
++
++    #[inline]
++    fn has_headerless_frame(&self) -> bool {
++        #[allow(clippy::single_match)]
++        match &self.window {
++            #[cfg(x11_platform)]
++            crate::platform_impl::Window::X(_) => false,
++            #[cfg(wayland_platform)]
++            crate::platform_impl::Window::Wayland(window) => window.has_headerless_frame(),
++        }
++    }
++
++    #[inline]
++    fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
++        #[allow(clippy::single_match)]
++        match &self.window {
++            #[cfg(x11_platform)]
++            crate::platform_impl::Window::X(_) => None,
++            #[cfg(wayland_platform)]
++            crate::platform_impl::Window::Wayland(window) => window.wayland_wm_state(),
++        }
++    }
+ }
+ 
+ /// Additional methods on [`WindowAttributes`] that are specific to Wayland.
+@@ -106,6 +195,15 @@ pub trait WindowAttributesExtWayland {
+     /// For details about application ID conventions, see the
+     /// [Desktop Entry Spec](https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-latest.html#desktop-file-id)
+     fn with_name(self, general: impl Into<String>, instance: impl Into<String>) -> Self;
++
++    /// Rune: makes the client-side frame of a decorated window without its header bar: the
++    /// shadow, the one-point border and the resize handles around a window that draws its own
++    /// title bar and buttons, with all four corners rounded while it floats. The window asks the
++    /// compositor for client-side decorations, so a compositor that would draw a frame of its
++    /// own leaves it to the window; one that draws its frame all the same keeps it, and the
++    /// window then has none of its own (`WindowExtWayland::has_headerless_frame`). Nothing
++    /// changes on X11.
++    fn with_headerless_frame(self, headerless: bool) -> Self;
+ }
+ 
+ impl WindowAttributesExtWayland for WindowAttributes {
+@@ -115,6 +213,12 @@ impl WindowAttributesExtWayland for WindowAttributes {
+             Some(crate::platform_impl::ApplicationName::new(general.into(), instance.into()));
+         self
+     }
++
++    #[inline]
++    fn with_headerless_frame(mut self, headerless: bool) -> Self {
++        self.platform_specific.headerless_frame = headerless;
++        self
++    }
+ }
+ 
+ /// Additional methods on `MonitorHandle` that are specific to Wayland.
+diff --git a/src/platform/windows.rs b/src/platform/windows.rs
+index e4593be10..5f1b92179 100644
+--- a/src/platform/windows.rs
++++ b/src/platform/windows.rs
+@@ -13,6 +13,14 @@ use crate::monitor::MonitorHandle;
+ use crate::window::{BadIcon, Icon, Window, WindowAttributes};
+ 
+ /// Window Handle type used by Win32 API
++/// Builds winit's keyboard-layout table for thread `thread_id`'s keyboard layout on the calling
++/// thread, so the first key or mouse message that thread's windows handle doesn't build it (8-10
++/// ms, every virtual key through `ToUnicodeEx`). Call it on a thread of its own at launch with
++/// the UI thread's id.
++pub fn warm_keyboard_layout(thread_id: u32) {
++    crate::platform_impl::warm_layout(thread_id);
++}
++
+ pub type HWND = isize;
+ /// Menu Handle type used by Win32 API
+ pub type HMENU = isize;
+diff --git a/src/platform/x11.rs b/src/platform/x11.rs
+index 4ab900c94..416c6dc20 100644
+--- a/src/platform/x11.rs
++++ b/src/platform/x11.rs
+@@ -137,9 +137,25 @@ impl<T> EventLoopBuilderExtX11 for EventLoopBuilder<T> {
+ }
+ 
+ /// Additional methods on [`Window`] that are specific to X11.
+-pub trait WindowExtX11 {}
++pub trait WindowExtX11 {
++    /// Rune: returns and clears whether an EWMH/GTK window-manager property (`_NET_WM_STATE`,
++    /// `_NET_WM_ALLOWED_ACTIONS`, `_GTK_EDGE_CONSTRAINTS`, or `_NET_FRAME_EXTENTS`) changed on
++    /// this window since the last call. Always `false` on Wayland.
++    fn take_wm_state_changed(&self) -> bool;
++}
+ 
+-impl WindowExtX11 for Window {}
++impl WindowExtX11 for Window {
++    #[inline]
++    fn take_wm_state_changed(&self) -> bool {
++        #[allow(clippy::single_match)]
++        match &self.window {
++            #[cfg(x11_platform)]
++            crate::platform_impl::Window::X(window) => window.take_wm_state_changed(),
++            #[cfg(wayland_platform)]
++            crate::platform_impl::Window::Wayland(_) => false,
++        }
++    }
++}
+ 
+ /// Additional methods on [`WindowAttributes`] that are specific to X11.
+ pub trait WindowAttributesExtX11 {
+diff --git a/src/platform_impl/linux/mod.rs b/src/platform_impl/linux/mod.rs
+index bc0e71c80..1e1ec46a5 100644
+--- a/src/platform_impl/linux/mod.rs
++++ b/src/platform_impl/linux/mod.rs
+@@ -73,6 +73,8 @@ impl ApplicationName {
+ pub struct PlatformSpecificWindowAttributes {
+     pub name: Option<ApplicationName>,
+     pub activation_token: Option<ActivationToken>,
++    /// Rune: see `WindowAttributesExtWayland::with_headerless_frame`.
++    pub headerless_frame: bool,
+     #[cfg(x11_platform)]
+     pub x11: X11WindowAttributes,
+ }
+@@ -96,6 +98,7 @@ impl Default for PlatformSpecificWindowAttributes {
+         Self {
+             name: None,
+             activation_token: None,
++            headerless_frame: false,
+             #[cfg(x11_platform)]
+             x11: X11WindowAttributes {
+                 visual_id: None,
+@@ -869,6 +872,19 @@ impl ActiveEventLoop {
+         }
+     }
+ 
++    /// Rune: opt into waking from `ControlFlow::Wait` on any Wayland display read; no-op on X11.
++    #[inline]
++    pub fn set_wake_on_wayland_read(&self, wake: bool) {
++        match *self {
++            #[cfg(wayland_platform)]
++            ActiveEventLoop::Wayland(ref evlp) => evlp.set_wake_on_wayland_read(wake),
++            #[cfg(x11_platform)]
++            ActiveEventLoop::X(_) => {
++                let _ = wake;
++            },
++        }
++    }
++
+     pub fn create_custom_cursor(&self, cursor: CustomCursorSource) -> CustomCursor {
+         x11_or_wayland!(match self; ActiveEventLoop(evlp) => evlp.create_custom_cursor(cursor))
+     }
+diff --git a/src/platform_impl/linux/wayland/event_loop/mod.rs b/src/platform_impl/linux/wayland/event_loop/mod.rs
+index fef13f455..f73e50056 100644
+--- a/src/platform_impl/linux/wayland/event_loop/mod.rs
++++ b/src/platform_impl/linux/wayland/event_loop/mod.rs
+@@ -107,10 +107,12 @@ impl<T: 'static> EventLoop<T> {
+         let wayland_dispatcher =
+             calloop::Dispatcher::new(wayland_source, |_, queue, winit_state: &mut WinitState| {
+                 let result = queue.dispatch_pending(winit_state);
+-                if result.is_ok()
+-                    && (!winit_state.events_sink.is_empty()
+-                        || !winit_state.window_compositor_updates.is_empty())
+-                {
++                if should_mark_dispatched(
++                    result.is_ok(),
++                    winit_state.wake_on_wayland_read,
++                    !winit_state.events_sink.is_empty(),
++                    !winit_state.window_compositor_updates.is_empty(),
++                ) {
+                     winit_state.dispatched_events = true;
+                 }
+                 result
+@@ -656,6 +658,12 @@ pub struct ActiveEventLoop {
+ }
+ 
+ impl ActiveEventLoop {
++    /// Rune: opt into waking from `ControlFlow::Wait` on any Wayland display read.
++    #[inline]
++    pub(crate) fn set_wake_on_wayland_read(&self, wake: bool) {
++        self.state.borrow_mut().wake_on_wayland_read = wake;
++    }
++
+     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
+         self.control_flow.set(control_flow)
+     }
+@@ -808,3 +816,32 @@ enum PumpEventNotifierAction {
+     /// Shutdown the thread.
+     Shutdown,
+ }
++
++/// Rune: whether a completed Wayland source read should set `WinitState::dispatched_events`.
++fn should_mark_dispatched(
++    read_ok: bool,
++    wake_on_wayland_read: bool,
++    has_events: bool,
++    has_compositor_updates: bool,
++) -> bool {
++    read_ok && (wake_on_wayland_read || has_events || has_compositor_updates)
++}
++
++#[cfg(test)]
++mod wake_on_wayland_read_tests {
++    use super::should_mark_dispatched;
++
++    #[test]
++    fn empty_sink_read_sets_dispatched_events_only_when_wake_flag_is_enabled() {
++        // Default (flag off): empty-sink reads do not wake from ControlFlow::Wait.
++        assert!(!should_mark_dispatched(true, false, false, false));
++        // Flag on: a successful empty-sink read wakes the loop for foreign queues.
++        assert!(should_mark_dispatched(true, true, false, false));
++        // Dispatch errors never mark dispatched_events even with the flag on.
++        assert!(!should_mark_dispatched(false, true, false, false));
++        assert!(!should_mark_dispatched(false, false, true, true));
++        // Non-empty winit sinks still wake when the flag is off.
++        assert!(should_mark_dispatched(true, false, true, false));
++        assert!(should_mark_dispatched(true, false, false, true));
++    }
++}
+diff --git a/src/platform_impl/linux/wayland/seat/pointer/mod.rs b/src/platform_impl/linux/wayland/seat/pointer/mod.rs
+index 3dcb00b26..88a3e5b40 100644
+--- a/src/platform_impl/linux/wayland/seat/pointer/mod.rs
++++ b/src/platform_impl/linux/wayland/seat/pointer/mod.rs
+@@ -169,7 +169,7 @@ impl PointerHandler for WinitState {
+                         window_id,
+                     );
+                 },
+-                PointerEventKind::Axis { horizontal, vertical, .. } => {
++                PointerEventKind::Axis { horizontal, vertical, source, .. } => {
+                     // Get the current phase.
+                     let mut pointer_data = pointer.winit_data().inner.lock().unwrap();
+ 
+@@ -203,8 +203,17 @@ impl PointerHandler for WinitState {
+                         )
+                     } else {
+                         // NOTE: Wayland sign convention is the inverse of winit.
++                        use sctk::reexports::client::protocol::wl_pointer::AxisSource;
++                        // Chromium 152, wayland_pointer.cc: OnAxis converts surface units by
++                        // kWheelDelta / kAxisValueScale. Only finger and continuous sources use
++                        // this gain here: a wheel can send axis-only frames between detents.
++                        const FINGER_POINTS_PER_AXIS_UNIT: f64 = 120.0 / 10.0;
++                        let gain = match source {
++                            Some(AxisSource::Finger | AxisSource::Continuous) => FINGER_POINTS_PER_AXIS_UNIT,
++                            _ => 1.0,
++                        };
+                         MouseScrollDelta::PixelDelta(
+-                            LogicalPosition::new(-horizontal.absolute, -vertical.absolute)
++                            LogicalPosition::new(-horizontal.absolute * gain, -vertical.absolute * gain)
+                                 .to_physical(scale_factor),
+                         )
+                     };
+diff --git a/src/platform_impl/linux/wayland/seat/touch/mod.rs b/src/platform_impl/linux/wayland/seat/touch/mod.rs
+index 124504fee..86dc8b4e8 100644
+--- a/src/platform_impl/linux/wayland/seat/touch/mod.rs
++++ b/src/platform_impl/linux/wayland/seat/touch/mod.rs
+@@ -21,15 +21,15 @@ impl TouchHandler for WinitState {
+         _: &Connection,
+         _: &QueueHandle<Self>,
+         touch: &WlTouch,
+-        _: u32,
++        serial: u32,
+         _: u32,
+         surface: WlSurface,
+         id: i32,
+         position: (f64, f64),
+     ) {
+         let window_id = wayland::make_wid(&surface);
+-        let scale_factor = match self.windows.get_mut().get(&window_id) {
+-            Some(window) => window.lock().unwrap().scale_factor(),
++        let window = match self.windows.get_mut().get(&window_id) {
++            Some(window) => window.clone(),
+             None => return,
+         };
+ 
+@@ -41,6 +41,12 @@ impl TouchHandler for WinitState {
+             },
+         };
+ 
++        let scale_factor = {
++            let mut window = window.lock().unwrap();
++            window.touch_down(id, touch.seat().clone(), serial);
++            window.scale_factor()
++        };
++
+         // Update the state of the point.
+         let location = LogicalPosition::<f64>::from(position);
+         seat_state.touch_map.insert(id, TouchPoint { surface, location });
+@@ -84,7 +90,11 @@ impl TouchHandler for WinitState {
+ 
+         let window_id = wayland::make_wid(&touch_point.surface);
+         let scale_factor = match self.windows.get_mut().get(&window_id) {
+-            Some(window) => window.lock().unwrap().scale_factor(),
++            Some(window) => {
++                let mut window = window.lock().unwrap();
++                window.touch_up(id, touch.seat());
++                window.scale_factor()
++            },
+             None => return,
+         };
+ 
+@@ -159,7 +169,11 @@ impl TouchHandler for WinitState {
+         for (id, touch_point) in seat_state.touch_map.drain() {
+             let window_id = wayland::make_wid(&touch_point.surface);
+             let scale_factor = match self.windows.get_mut().get(&window_id) {
+-                Some(window) => window.lock().unwrap().scale_factor(),
++                Some(window) => {
++                    let mut window = window.lock().unwrap();
++                    window.touch_up(id, touch.seat());
++                    window.scale_factor()
++                },
+                 None => return,
+             };
+ 
+diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
+index 13ef99c26..942b78512 100644
+--- a/src/platform_impl/linux/wayland/state.rs
++++ b/src/platform_impl/linux/wayland/state.rs
+@@ -33,6 +33,7 @@ use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
+ use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
+ use crate::platform_impl::wayland::types::wp_viewporter::ViewporterState;
+ use crate::platform_impl::wayland::types::xdg_activation::XdgActivationState;
++use crate::platform_impl::wayland::types::xdg_toplevel_icon::XdgToplevelIconManagerState;
+ use crate::platform_impl::wayland::window::{WindowRequests, WindowState};
+ use crate::platform_impl::wayland::{WaylandError, WindowId};
+ use crate::platform_impl::OsError;
+@@ -94,6 +95,9 @@ pub struct WinitState {
+     /// Xdg activation.
+     pub xdg_activation: Option<XdgActivationState>,
+ 
++    /// Xdg toplevel icon manager, for window icons.
++    pub xdg_toplevel_icon_manager: Option<XdgToplevelIconManagerState>,
++
+     /// Relative pointer.
+     pub relative_pointer: Option<RelativePointerState>,
+ 
+@@ -115,6 +119,11 @@ pub struct WinitState {
+     /// Whether we have dispatched events to the user thus we want to
+     /// send `AboutToWait` and normally wakeup the user.
+     pub dispatched_events: bool,
++
++    /// Rune: when true, any successful Wayland display read marks `dispatched_events = true`
++    /// even when winit's own event sinks are empty, so foreign queues sharing the display
++    /// dispatch on that turn without background reader threads.
++    pub wake_on_wayland_read: bool,
+ }
+ 
+ impl WinitState {
+@@ -123,6 +132,19 @@ impl WinitState {
+         queue_handle: &QueueHandle<Self>,
+         loop_handle: LoopHandle<'static, WinitState>,
+     ) -> Result<Self, OsError> {
++        // A compositor without the decoration protocol answers a decorated window's first
++        // configure with a client-side frame, and that frame reads the system's colour scheme and
++        // button layout through two `dbus-send` processes, 100 ms of reply timeout each. Started
++        // here, on threads of their own, they are done (or well on their way) when the configure
++        // asks, instead of running one after the other on this thread before the first frame.
++        #[cfg(feature = "sctk-adwaita")]
++        if !globals
++            .contents()
++            .with_list(|list| list.iter().any(|global| global.interface == "zxdg_decoration_manager_v1"))
++        {
++            sctk_adwaita::read_system_config_early();
++        }
++
+         let registry_state = RegistryState::new(globals);
+         let compositor_state =
+             CompositorState::bind(globals, queue_handle).map_err(WaylandError::Bind)?;
+@@ -169,6 +191,8 @@ impl WinitState {
+ 
+             xdg_shell: XdgShell::bind(globals, queue_handle).map_err(WaylandError::Bind)?,
+             xdg_activation: XdgActivationState::bind(globals, queue_handle).ok(),
++            xdg_toplevel_icon_manager: XdgToplevelIconManagerState::bind(globals, queue_handle)
++                .ok(),
+ 
+             windows: Default::default(),
+             window_requests: Default::default(),
+@@ -192,6 +216,7 @@ impl WinitState {
+             loop_handle,
+             // Make it true by default.
+             dispatched_events: true,
++            wake_on_wayland_read: false,
+         })
+     }
+ 
+@@ -313,6 +338,8 @@ impl OutputHandler for WinitState {
+ 
+     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+         self.monitors.lock().unwrap().push(MonitorHandle::new(output));
++        // Rune: wake `AboutToWait` in case `wl_surface.enter` arrived before `wl_output.done`.
++        self.dispatched_events = true;
+     }
+ 
+     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, updated: WlOutput) {
+@@ -330,6 +357,8 @@ impl OutputHandler for WinitState {
+         let removed = MonitorHandle::new(removed);
+         if let Some(pos) = monitors.iter().position(|output| output == &removed) {
+             monitors.remove(pos);
++            // Rune: wake `AboutToWait` even when the compositor sent no `wl_surface.leave`.
++            self.dispatched_events = true;
+         }
+     }
+ }
+@@ -352,6 +381,8 @@ impl CompositorHandler for WinitState {
+         _: &WlSurface,
+         _: &WlOutput,
+     ) {
++        // Rune: wake `AboutToWait` so output-presence hooks see entry at scale 1 without resize.
++        self.dispatched_events = true;
+     }
+ 
+     fn surface_leave(
+@@ -361,6 +392,8 @@ impl CompositorHandler for WinitState {
+         _: &WlSurface,
+         _: &WlOutput,
+     ) {
++        // Rune: wake `AboutToWait` so output-presence hooks see leave without resize.
++        self.dispatched_events = true;
+     }
+ 
+     fn scale_factor_changed(
+diff --git a/src/platform_impl/linux/wayland/types/mod.rs b/src/platform_impl/linux/wayland/types/mod.rs
+index 77e67f48b..a8347ef95 100644
+--- a/src/platform_impl/linux/wayland/types/mod.rs
++++ b/src/platform_impl/linux/wayland/types/mod.rs
+@@ -5,3 +5,4 @@ pub mod kwin_blur;
+ pub mod wp_fractional_scaling;
+ pub mod wp_viewporter;
+ pub mod xdg_activation;
++pub mod xdg_toplevel_icon;
+diff --git a/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs b/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs
+new file mode 100644
+index 000000000..eaa73dc70
+--- /dev/null
++++ b/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs
+@@ -0,0 +1,92 @@
++//! Handling of xdg toplevel icons, the window's own icon (backport of rust-windowing/winit#4288).
++
++use sctk::globals::GlobalData;
++use sctk::reexports::client::globals::{BindError, GlobalList};
++use sctk::reexports::client::protocol::wl_shm::Format;
++use sctk::reexports::client::{delegate_dispatch, Connection, Dispatch, Proxy, QueueHandle};
++use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
++use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_v1::XdgToplevelIconV1;
++use sctk::shm::slot::{Buffer, CreateBufferError, SlotPool};
++
++use crate::platform_impl::wayland::state::WinitState;
++use crate::platform_impl::PlatformIcon;
++
++#[derive(Debug)]
++pub struct XdgToplevelIconManagerState {
++    xdg_toplevel_icon_manager: XdgToplevelIconManagerV1,
++}
++
++impl XdgToplevelIconManagerState {
++    pub fn bind(
++        globals: &GlobalList,
++        queue_handle: &QueueHandle<WinitState>,
++    ) -> Result<Self, BindError> {
++        let xdg_toplevel_icon_manager = globals.bind(queue_handle, 1..=1, GlobalData)?;
++        Ok(Self { xdg_toplevel_icon_manager })
++    }
++
++    pub fn global(&self) -> &XdgToplevelIconManagerV1 {
++        &self.xdg_toplevel_icon_manager
++    }
++}
++
++/// The window's icon in an shm buffer, kept alive while the toplevel shows it.
++#[derive(Debug)]
++pub struct ToplevelIcon {
++    buffer: Buffer,
++}
++
++impl ToplevelIcon {
++    pub(crate) fn new(icon: &PlatformIcon, pool: &mut SlotPool) -> Result<Self, CreateBufferError> {
++        let (width, height) = (icon.width as i32, icon.height as i32);
++        let (buffer, canvas) = pool.create_buffer(width, height, 4 * width, Format::Argb8888)?;
++        argb_premultiplied(&icon.rgba, canvas);
++        Ok(Self { buffer })
++    }
++
++    pub fn add_buffer(&self, xdg_toplevel_icon: &XdgToplevelIconV1) {
++        xdg_toplevel_icon.add_buffer(self.buffer.wl_buffer(), 1);
++    }
++}
++
++/// Writes straight RGBA pixels as premultiplied little-endian ARGB8888.
++fn argb_premultiplied(rgba: &[u8], canvas: &mut [u8]) {
++    for (canvas_chunk, rgba) in canvas.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
++        let alpha = rgba[3] as f32 / 255.;
++        let r = (rgba[0] as f32 * alpha) as u32;
++        let g = (rgba[1] as f32 * alpha) as u32;
++        let b = (rgba[2] as f32 * alpha) as u32;
++        let color = ((rgba[3] as u32) << 24) + (r << 16) + (g << 8) + b;
++        let array: &mut [u8; 4] = canvas_chunk.try_into().unwrap();
++        *array = color.to_le_bytes();
++    }
++}
++
++impl Dispatch<XdgToplevelIconManagerV1, GlobalData, WinitState> for XdgToplevelIconManagerState {
++    fn event(
++        _state: &mut WinitState,
++        _proxy: &XdgToplevelIconManagerV1,
++        _event: <XdgToplevelIconManagerV1 as Proxy>::Event,
++        _data: &GlobalData,
++        _conn: &Connection,
++        _qhandle: &QueueHandle<WinitState>,
++    ) {
++        // Preferred icon sizes: one buffer is enough, the compositor scales it.
++    }
++}
++
++impl Dispatch<XdgToplevelIconV1, GlobalData, WinitState> for XdgToplevelIconManagerState {
++    fn event(
++        _state: &mut WinitState,
++        _proxy: &XdgToplevelIconV1,
++        _event: <XdgToplevelIconV1 as Proxy>::Event,
++        _data: &GlobalData,
++        _conn: &Connection,
++        _qhandle: &QueueHandle<WinitState>,
++    ) {
++        // No events.
++    }
++}
++
++delegate_dispatch!(WinitState: [XdgToplevelIconManagerV1: GlobalData] => XdgToplevelIconManagerState);
++delegate_dispatch!(WinitState: [XdgToplevelIconV1: GlobalData] => XdgToplevelIconManagerState);
+diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
+index 6d29a5a5f..f41db179c 100644
+--- a/src/platform_impl/linux/wayland/window/mod.rs
++++ b/src/platform_impl/linux/wayland/window/mod.rs
+@@ -98,7 +98,11 @@ impl Window {
+ 
+         // We prefer server side decorations, however to not have decorations we ask for client
+         // side decorations instead.
+-        let default_decorations = if attributes.decorations {
++        //
++        // Rune: and for a frame without a header bar, which is the client's to draw: the
++        // compositor's frame would put a bar of its own above the window's.
++        let headerless = attributes.platform_specific.headerless_frame;
++        let default_decorations = if attributes.decorations && !headerless {
+             WindowDecorations::RequestServer
+         } else {
+             WindowDecorations::RequestClient
+@@ -121,6 +125,9 @@ impl Window {
+ 
+         window_state.set_blur(attributes.blur);
+ 
++        // Rune: before the first configure, which makes the frame.
++        window_state.set_headerless_frame(headerless);
++
+         // Set the decorations hint.
+         window_state.set_decorate(attributes.decorations);
+ 
+@@ -132,6 +139,9 @@ impl Window {
+         // Set the window title.
+         window_state.set_title(attributes.title);
+ 
++        // Set the window icon before the first commit.
++        window_state.set_window_icon(attributes.window_icon.map(|icon| icon.inner));
++
+         // Set the min and max sizes. We must set the hints upon creating a window, so
+         // we use the default `1.` scaling...
+         let min_size = attributes.min_inner_size.map(|size| size.to_logical(1.));
+@@ -426,11 +436,38 @@ impl Window {
+         self.window_state.lock().unwrap().is_decorated()
+     }
+ 
++    /// Rune: see `WindowExtWayland::content_corner_radius`.
++    #[inline]
++    pub fn content_corner_radius(&self) -> f32 {
++        self.window_state.lock().unwrap().content_corner_radius()
++    }
++
++    /// Rune: see `WindowExtWayland::has_client_side_frame`.
++    #[inline]
++    pub fn has_client_side_frame(&self) -> bool {
++        self.window_state.lock().unwrap().has_client_side_frame()
++    }
++
++
++    /// Rune: see `WindowExtWayland::has_headerless_frame`.
++    #[inline]
++    pub fn has_headerless_frame(&self) -> bool {
++        self.window_state.lock().unwrap().has_headerless_frame()
++    }
++
++    /// Rune: see `WindowExtWayland::wayland_wm_state`.
++    #[inline]
++    pub fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
++        self.window_state.lock().unwrap().wayland_wm_state()
++    }
++
+     #[inline]
+     pub fn set_window_level(&self, _level: WindowLevel) {}
+ 
+     #[inline]
+-    pub(crate) fn set_window_icon(&self, _window_icon: Option<PlatformIcon>) {}
++    pub(crate) fn set_window_icon(&self, window_icon: Option<PlatformIcon>) {
++        self.window_state.lock().unwrap().set_window_icon(window_icon);
++    }
+ 
+     #[inline]
+     pub fn set_minimized(&self, minimized: bool) {
+@@ -636,7 +673,13 @@ impl Window {
+     #[inline]
+     pub fn current_monitor(&self) -> Option<MonitorHandle> {
+         let data = self.window.wl_surface().data::<SurfaceData>()?;
+-        data.outputs().next().map(MonitorHandle::new)
++        // Rune: compositors like Sway may destroy a `wl_output` global without sending
++        // `wl_surface.leave`, leaving a dead output at index 0 of `SurfaceData::outputs`.
++        // Skip removed outputs so `current_monitor` returns `None` or the next live output.
++        let monitors = self.monitors.lock().unwrap();
++        data.outputs()
++            .find(|output| monitors.iter().any(|m| m.proxy == *output))
++            .map(MonitorHandle::new)
+     }
+ 
+     #[inline]
+diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
+index 1ef7a0656..4bee985d5 100644
+--- a/src/platform_impl/linux/wayland/window/state.rs
++++ b/src/platform_impl/linux/wayland/window/state.rs
+@@ -19,8 +19,10 @@ use sctk::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_
+ use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
+ use sctk::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
+ use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
++use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
+ 
+ use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
++use sctk::globals::GlobalData;
+ use sctk::seat::pointer::{PointerDataExt, ThemedPointer};
+ use sctk::shell::xdg::window::{DecorationMode, Window, WindowConfigure};
+ use sctk::shell::xdg::XdgSurface;
+@@ -36,7 +38,8 @@ use crate::error::{ExternalError, NotSupportedError};
+ use crate::platform_impl::wayland::logical_to_physical_rounded;
+ use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
+ use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
+-use crate::platform_impl::{PlatformCustomCursor, WindowId};
++use crate::platform_impl::wayland::types::xdg_toplevel_icon::ToplevelIcon;
++use crate::platform_impl::{PlatformCustomCursor, PlatformIcon, WindowId};
+ use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
+ 
+ use crate::platform_impl::wayland::seat::{
+@@ -63,12 +66,21 @@ pub struct WindowState {
+     // A shared pool where to allocate custom cursors.
+     custom_cursor_pool: Arc<Mutex<SlotPool>>,
+ 
++    /// Xdg toplevel icon manager, to set the window's icon.
++    xdg_toplevel_icon_manager: Option<XdgToplevelIconManagerV1>,
++
++    /// The window's current icon, whose buffer the compositor may still read.
++    toplevel_icon: Option<ToplevelIcon>,
++
+     /// The last received configure.
+     pub last_configure: Option<WindowConfigure>,
+ 
+     /// The pointers observed on the window.
+     pub pointers: Vec<Weak<ThemedPointer<WinitPointerData>>>,
+ 
++    /// Rune: active touches on the window, for interactive move/resize/menu serials.
++    active_touches: ActiveTouches<WlSeat>,
++
+     selected_cursor: SelectedCursor,
+ 
+     /// Whether the cursor is visible.
+@@ -121,6 +133,10 @@ pub struct WindowState {
+     /// Whether the CSD fail to create, so we don't try to create them on each iteration.
+     csd_fails: bool,
+ 
++    /// Rune: a client-side frame made for this window has no header bar (see
++    /// `WindowAttributesExtWayland::with_headerless_frame`).
++    headerless: bool,
++
+     /// Whether we should decorate the frame.
+     decorate: bool,
+ 
+@@ -182,13 +198,18 @@ impl WindowState {
+             .fractional_scaling_manager
+             .as_ref()
+             .map(|fsm| fsm.fractional_scaling(window.wl_surface(), queue_handle));
++        let xdg_toplevel_icon_manager =
++            winit_state.xdg_toplevel_icon_manager.as_ref().map(|manager| manager.global().clone());
+ 
+         Self {
++            toplevel_icon: None,
++            xdg_toplevel_icon_manager,
+             blur: None,
+             blur_manager: winit_state.kwin_blur_manager.clone(),
+             compositor,
+             connection,
+             csd_fails: false,
++            headerless: false,
+             cursor_grab_mode: GrabState::new(),
+             selected_cursor: Default::default(),
+             cursor_visible: true,
+@@ -206,6 +227,7 @@ impl WindowState {
+             resize_increments: None,
+             pointer_constraints,
+             pointers: Default::default(),
++            active_touches: ActiveTouches::default(),
+             queue_handle: queue_handle.clone(),
+             resizable: true,
+             scale_factor: 1.,
+@@ -234,6 +256,28 @@ impl WindowState {
+         })
+     }
+ 
++    /// Rune: record an active touch down on this window.
++    pub fn touch_down(&mut self, id: i32, seat: WlSeat, serial: u32) {
++        self.active_touches.down(id, seat, serial);
++    }
++
++    /// Rune: clear a touch point that ended or was cancelled on this window.
++    pub fn touch_up(&mut self, id: i32, seat: &WlSeat) {
++        self.active_touches.up(id, seat);
++    }
++
++    /// Rune: run an interactive xdg-shell request using the active touch's `(seat, serial)`,
++    /// falling back to the observed pointers' latest button serial when no touch is down.
++    fn with_interactive_serial(&self, mut callback: impl FnMut(&WlSeat, u32)) {
++        if let Some((seat, serial)) = self.active_touches.latest() {
++            callback(seat, serial);
++            return;
++        }
++        self.apply_on_pointer(|_, data| {
++            callback(data.seat(), data.latest_button_serial());
++        });
++    }
++
+     /// Get the current state of the frame callback.
+     pub fn frame_callback_state(&self) -> FrameCallbackState {
+         self.frame_callback_state
+@@ -280,6 +324,12 @@ impl WindowState {
+                 && self.frame.is_none()
+                 && !self.csd_fails
+         }) {
++            // Rune: without its header bar where the window asked for that.
++            #[cfg(feature = "sctk-adwaita")]
++            let frame_config = match self.headerless {
++                true => into_sctk_adwaita_config(self.theme).headerless(),
++                false => into_sctk_adwaita_config(self.theme),
++            };
+             match WinitFrame::new(
+                 &self.window,
+                 shm,
+@@ -288,7 +338,7 @@ impl WindowState {
+                 subcompositor.clone(),
+                 self.queue_handle.clone(),
+                 #[cfg(feature = "sctk-adwaita")]
+-                into_sctk_adwaita_config(self.theme),
++                frame_config,
+             ) {
+                 Ok(mut frame) => {
+                     frame.set_title(&self.title);
+@@ -380,6 +430,9 @@ impl WindowState {
+ 
+         let new_state = configure.state;
+         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
++        let old_decoration_mode =
++            self.last_configure.as_ref().map(|configure| configure.decoration_mode);
++        let old_capabilities = self.last_configure.as_ref().map(|configure| configure.capabilities);
+ 
+         let state_change_requires_resize = old_state
+             .map(|old_state| {
+@@ -387,6 +440,8 @@ impl WindowState {
+                     .symmetric_difference(new_state)
+                     .difference(XdgWindowState::ACTIVATED | XdgWindowState::SUSPENDED)
+                     .is_empty()
++                    || old_decoration_mode != Some(configure.decoration_mode)
++                    || old_capabilities != Some(configure.capabilities)
+             })
+             // NOTE: `None` is present for the initial configure, thus we must always resize.
+             .unwrap_or(true);
+@@ -398,6 +453,10 @@ impl WindowState {
+             self.resize(new_size);
+             true
+         } else {
++            // Rune: the frame may have appeared or gone, or turned square, and no resize follows to
++            // tell the compositor: the opaque region follows it now that it knows this configure's
++            // state.
++            self.reload_transparency_hint();
+             false
+         }
+     }
+@@ -431,11 +490,7 @@ impl WindowState {
+     /// Start interacting drag resize.
+     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
+         let xdg_toplevel = self.window.xdg_toplevel();
+-
+-        // TODO(kchibisov) handle touch serials.
+-        self.apply_on_pointer(|_, data| {
+-            let serial = data.latest_button_serial();
+-            let seat = data.seat();
++        self.with_interactive_serial(|seat, serial| {
+             xdg_toplevel.resize(seat, serial, direction.into());
+         });
+ 
+@@ -445,10 +500,7 @@ impl WindowState {
+     /// Start the window drag.
+     pub fn drag_window(&self) -> Result<(), ExternalError> {
+         let xdg_toplevel = self.window.xdg_toplevel();
+-        // TODO(kchibisov) handle touch serials.
+-        self.apply_on_pointer(|_, data| {
+-            let serial = data.latest_button_serial();
+-            let seat = data.seat();
++        self.with_interactive_serial(|seat, serial| {
+             xdg_toplevel._move(seat, serial);
+         });
+ 
+@@ -599,6 +651,72 @@ impl WindowState {
+         }
+     }
+ 
++    /// Rune: whether a client-side frame draws the window's decorations, whatever state it is in:
++    /// a maximized, tiled or fullscreen window keeps its frame (it draws square corners there),
++    /// which only hides parts of itself. False when the compositor draws the decorations, when
++    /// decorations are off, and when the frame could not be made (no subcompositor, or a frame that
++    /// failed to build).
++    #[inline]
++    pub fn has_client_side_frame(&self) -> bool {
++        self.decorate
++            && self
++                .last_configure
++                .as_ref()
++                .is_some_and(|configure| configure.decoration_mode == DecorationMode::Client)
++            && self.frame.is_some()
++    }
++
++    /// Rune: confirmed Wayland `xdg_toplevel` / `xdg-decoration` state from `last_configure`,
++    /// gated by `xdg_toplevel` protocol version (`>= 2` for tiled edges, `>= 5` for
++    /// `wm_capabilities`).
++    #[inline]
++    pub fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
++        let configure = self.last_configure.as_ref()?;
++        let server = matches!(configure.decoration_mode, DecorationMode::Server);
++        let version = self.window.xdg_toplevel().version();
++        let tiled = (version >= 2).then(|| {
++            [
++                configure.is_tiled_top(),
++                configure.is_tiled_right(),
++                configure.is_tiled_bottom(),
++                configure.is_tiled_left(),
++            ]
++        });
++        let capabilities = (version >= 5).then(|| configure.capabilities.bits());
++        Some((server, tiled, capabilities))
++    }
++
++    /// Rune: see `WindowAttributesExtWayland::with_headerless_frame`. It holds for a frame made
++    /// after it: the frame is made in the window's first configure.
++    #[inline]
++    pub fn set_headerless_frame(&mut self, headerless: bool) {
++        self.headerless = headerless;
++    }
++
++    /// Rune: whether a client-side frame without a header bar draws around the window: its
++    /// content then leaves its top corners the arc of `content_corner_radius` too.
++    #[inline]
++    pub fn has_headerless_frame(&self) -> bool {
++        self.headerless && self.has_client_side_frame()
++    }
++
++    /// Rune: the radius, in logical points, of the arc the window's content takes at its bottom
++    /// corners, which the client-side frame leaves it (the frame's visible border lies just
++    /// outside it). Zero when no client-side frame is drawn, and when the frame draws the window
++    /// square: maximized, tiled or fullscreen.
++    #[inline]
++    pub fn content_corner_radius(&self) -> f32 {
++        #[cfg(feature = "sctk-adwaita")]
++        if let Some(frame) = self
++            .frame
++            .as_ref()
++            .filter(|frame| self.decorate && !frame.is_hidden())
++        {
++            return frame.content_corner_radius();
++        }
++        0.
++    }
++
+     /// Get the outer size of the window.
+     #[inline]
+     pub fn outer_size(&self) -> LogicalSize<u32> {
+@@ -655,17 +773,36 @@ impl WindowState {
+     }
+ 
+     /// Reissue the transparency hint to the compositor.
++    ///
++    /// Rune: a client-side frame that rounds the content's bottom corners leaves the two corner
++    /// squares to the compositor, so an opaque window keeps the rest of itself opaque instead of
++    /// blending all of it.
+     pub fn reload_transparency_hint(&self) {
+         let surface = self.window.wl_surface();
+ 
+         if self.transparent {
+             surface.set_opaque_region(None);
+-        } else if let Ok(region) = Region::new(&*self.compositor) {
++            return;
++        }
++        let Ok(region) = Region::new(&*self.compositor) else {
++            warn!("Failed to mark window opaque.");
++            return;
++        };
++        let radius = self.content_corner_radius() as i32;
++        let (width, height) = (self.size.width as i32, self.size.height as i32);
++        if radius <= 0 || width <= 2 * radius || height <= radius {
+             region.add(0, 0, i32::MAX, i32::MAX);
+-            surface.set_opaque_region(Some(region.wl_region()));
++        } else if self.has_headerless_frame() && height > 2 * radius {
++            // A frame without a header rounds the top corners too: everything but the four
++            // squares its arcs cross.
++            region.add(radius, 0, width - 2 * radius, height);
++            region.add(0, radius, width, height - 2 * radius);
+         } else {
+-            warn!("Failed to mark window opaque.");
++            // Everything but the two squares the frame's arcs cross at the window's foot.
++            region.add(0, 0, width, height - radius);
++            region.add(radius, height - radius, width - 2 * radius, radius);
+         }
++        surface.set_opaque_region(Some(region.wl_region()));
+     }
+ 
+     /// Try to resize the window when the user can do so.
+@@ -932,10 +1069,7 @@ impl WindowState {
+     }
+ 
+     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
+-        // TODO(kchibisov) handle touch serials.
+-        self.apply_on_pointer(|_, data| {
+-            let serial = data.latest_button_serial();
+-            let seat = data.seat();
++        self.with_interactive_serial(|seat, serial| {
+             self.window.show_window_menu(seat, serial, position.into());
+         });
+     }
+@@ -992,7 +1126,10 @@ impl WindowState {
+                 // To disable decorations we should request client and hide the frame.
+                 self.window.request_decoration_mode(Some(DecorationMode::Client))
+             },
+-            _ if self.decorate => self.window.request_decoration_mode(Some(DecorationMode::Server)),
++            // Rune: a frame without a header bar stays the client's (see `Window::new`).
++            _ if self.decorate && !self.headerless => {
++                self.window.request_decoration_mode(Some(DecorationMode::Server))
++            },
+             _ => (),
+         }
+ 
+@@ -1117,6 +1254,41 @@ impl WindowState {
+         self.title = title;
+     }
+ 
++    /// Set the window's icon through `xdg_toplevel_icon_v1`, when the compositor has it.
++    pub(crate) fn set_window_icon(&mut self, window_icon: Option<PlatformIcon>) {
++        let Some(manager) = self.xdg_toplevel_icon_manager.as_ref() else {
++            if window_icon.is_some() {
++                info!("`xdg_toplevel_icon_manager_v1` is not supported");
++            }
++            return;
++        };
++
++        let (toplevel_icon, xdg_toplevel_icon) = match window_icon {
++            Some(icon) => {
++                let mut pool = self.custom_cursor_pool.lock().unwrap();
++                let toplevel_icon = match ToplevelIcon::new(&icon, &mut pool) {
++                    Ok(toplevel_icon) => toplevel_icon,
++                    Err(error) => {
++                        warn!("Error setting window icon: {error}");
++                        return;
++                    },
++                };
++                let xdg_toplevel_icon = manager.create_icon(&self.queue_handle, GlobalData);
++                toplevel_icon.add_buffer(&xdg_toplevel_icon);
++                (Some(toplevel_icon), Some(xdg_toplevel_icon))
++            },
++            None => (None, None),
++        };
++
++        manager.set_icon(self.window.xdg_toplevel(), xdg_toplevel_icon.as_ref());
++        self.toplevel_icon = toplevel_icon;
++
++        // The icon object is immutable once set; the toplevel keeps what it showed.
++        if let Some(xdg_toplevel_icon) = xdg_toplevel_icon {
++            xdg_toplevel_icon.destroy();
++        }
++    }
++
+     /// Mark the window as transparent.
+     #[inline]
+     pub fn set_transparent(&mut self, transparent: bool) {
+@@ -1218,3 +1390,58 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
+         None => sctk_adwaita::FrameConfig::auto(),
+     }
+ }
++
++/// Rune: active touches on a window `(id, seat, down_serial)` in arrival order.
++#[derive(Debug)]
++struct ActiveTouches<S> {
++    points: Vec<(i32, S, u32)>,
++}
++
++impl<S> Default for ActiveTouches<S> {
++    fn default() -> Self {
++        Self { points: Vec::new() }
++    }
++}
++
++impl<S: PartialEq> ActiveTouches<S> {
++    fn down(&mut self, id: i32, seat: S, serial: u32) {
++        self.points.retain(|(i, s, _)| !(*i == id && *s == seat));
++        self.points.push((id, seat, serial));
++    }
++
++    fn up(&mut self, id: i32, seat: &S) {
++        self.points.retain(|(i, s, _)| !(*i == id && s == seat));
++    }
++
++    fn latest(&self) -> Option<(&S, u32)> {
++        self.points.last().map(|(_, seat, serial)| (seat, *serial))
++    }
++}
++
++#[cfg(test)]
++mod touch_serial_tests {
++    use super::ActiveTouches;
++
++    #[test]
++    fn active_touch_serial_tracks_down_up_and_multitouch() {
++        let mut touches = ActiveTouches::default();
++        assert_eq!(touches.latest(), None);
++
++        touches.down(0, "seat0", 41);
++        assert_eq!(touches.latest(), Some((&"seat0", 41)));
++
++        // Second finger down becomes latest; lifting it restores the first finger's serial.
++        touches.down(1, "seat0", 42);
++        assert_eq!(touches.latest(), Some((&"seat0", 42)));
++        touches.up(1, &"seat0");
++        assert_eq!(touches.latest(), Some((&"seat0", 41)));
++
++        // Duplicate id on the same seat updates its serial without duplicating entries.
++        touches.down(0, "seat0", 43);
++        assert_eq!(touches.latest(), Some((&"seat0", 43)));
++
++        // Lifting the last finger returns None so callers fall back to pointer serials.
++        touches.up(0, &"seat0");
++        assert_eq!(touches.latest(), None);
++    }
++}
+diff --git a/src/platform_impl/linux/x11/atoms.rs b/src/platform_impl/linux/x11/atoms.rs
+index c6d96c8fe..cc6248e75 100644
+--- a/src/platform_impl/linux/x11/atoms.rs
++++ b/src/platform_impl/linux/x11/atoms.rs
+@@ -93,7 +93,9 @@ atom_manager! {
+     None: b"None",
+ 
+     // Miscellaneous Atoms
++    _GTK_EDGE_CONSTRAINTS,
+     _GTK_THEME_VARIANT,
++    _NET_WM_ALLOWED_ACTIONS,
+     _MOTIF_WM_HINTS,
+     _NET_ACTIVE_WINDOW,
+     _NET_CLIENT_LIST,
+diff --git a/src/platform_impl/linux/x11/event_processor.rs b/src/platform_impl/linux/x11/event_processor.rs
+index 79f5c114f..ce78af014 100644
+--- a/src/platform_impl/linux/x11/event_processor.rs
++++ b/src/platform_impl/linux/x11/event_processor.rs
+@@ -857,6 +857,18 @@ impl EventProcessor {
+             || atom == atoms[_XSETTINGS_SETTINGS]
+         {
+             self.process_dpi_change(&mut callback);
++        } else if atom == atoms[_NET_WM_STATE]
++            || atom == atoms[_NET_WM_ALLOWED_ACTIONS]
++            || atom == atoms[_GTK_EDGE_CONSTRAINTS]
++            || atom == atoms[_NET_FRAME_EXTENTS]
++        {
++            let xwindow = xev.window as xproto::Window;
++            if self.with_window(xwindow, |window| window.mark_wm_state_changed()).is_some() {
++                callback(&self.target, Event::WindowEvent {
++                    window_id: mkwid(xwindow),
++                    event: WindowEvent::RedrawRequested,
++                });
++            }
+         }
+     }
+ 
+diff --git a/src/platform_impl/linux/x11/window.rs b/src/platform_impl/linux/x11/window.rs
+index 7e15d5f24..3cdcecfd3 100644
+--- a/src/platform_impl/linux/x11/window.rs
++++ b/src/platform_impl/linux/x11/window.rs
+@@ -2,6 +2,7 @@ use std::ffi::CString;
+ use std::mem::replace;
+ use std::os::raw::*;
+ use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ use std::{cmp, env};
+ 
+@@ -124,6 +125,7 @@ pub struct UnownedWindow {
+     pub shared_state: Mutex<SharedState>,
+     redraw_sender: WakeSender<WindowId>,
+     activation_sender: WakeSender<super::ActivationToken>,
++    wm_state_changed: AtomicBool,
+ }
+ 
+ macro_rules! leap {
+@@ -351,6 +353,7 @@ impl UnownedWindow {
+             shared_state: SharedState::new(guessed_monitor, &window_attrs),
+             redraw_sender: event_loop.redraw_sender.clone(),
+             activation_sender: event_loop.activation_sender.clone(),
++            wm_state_changed: AtomicBool::new(false),
+         };
+ 
+         // Title must be set before mapping. Some tiling window managers (i.e. i3) use the window
+@@ -826,6 +829,19 @@ impl UnownedWindow {
+         }
+     }
+ 
++    /// Rune: records that an EWMH/GTK window-manager property changed on this window.
++    #[inline]
++    pub(crate) fn mark_wm_state_changed(&self) {
++        self.wm_state_changed.store(true, Ordering::Release);
++    }
++
++    /// Rune: returns and clears whether an EWMH/GTK window-manager property changed since
++    /// the last check (`WindowExtX11::take_wm_state_changed`).
++    #[inline]
++    pub fn take_wm_state_changed(&self) -> bool {
++        self.wm_state_changed.swap(false, Ordering::AcqRel)
++    }
++
+     // Called by EventProcessor when a VisibilityNotify event is received
+     pub(crate) fn visibility_notify(&self) {
+         let mut shared_state = self.shared_state_lock();
+diff --git a/src/platform_impl/macos/app_state.rs b/src/platform_impl/macos/app_state.rs
+index dd2ccd116..b65f38187 100644
+--- a/src/platform_impl/macos/app_state.rs
++++ b/src/platform_impl/macos/app_state.rs
+@@ -23,6 +23,9 @@ pub(super) struct AppState {
+     activation_policy: Option<NSApplicationActivationPolicy>,
+     default_menu: bool,
+     activate_ignoring_other_apps: bool,
++    init_before_finish_launching: bool,
++    /// Whether `applicationWillFinishLaunching:` dispatched the init events.
++    init_dispatched: Cell<bool>,
+     run_loop: RunLoop,
+     event_handler: EventHandler,
+     stop_on_launch: Cell<bool>,
+@@ -61,6 +64,11 @@ declare_class!(
+     unsafe impl NSObjectProtocol for ApplicationDelegate {}
+ 
+     unsafe impl NSApplicationDelegate for ApplicationDelegate {
++        #[method(applicationWillFinishLaunching:)]
++        fn app_will_finish_launching(&self, notification: &NSNotification) {
++            self.will_finish_launching(notification)
++        }
++
+         #[method(applicationDidFinishLaunching:)]
+         fn app_did_finish_launching(&self, notification: &NSNotification) {
+             self.did_finish_launching(notification)
+@@ -79,11 +87,14 @@ impl ApplicationDelegate {
+         activation_policy: Option<NSApplicationActivationPolicy>,
+         default_menu: bool,
+         activate_ignoring_other_apps: bool,
++        init_before_finish_launching: bool,
+     ) -> Retained<Self> {
+         let this = mtm.alloc().set_ivars(AppState {
+             activation_policy,
+             default_menu,
+             activate_ignoring_other_apps,
++            init_before_finish_launching,
++            init_dispatched: Cell::new(false),
+             run_loop: RunLoop::main(mtm),
+             event_handler: EventHandler::new(),
+             stop_on_launch: Cell::new(false),
+@@ -102,6 +113,35 @@ impl ApplicationDelegate {
+         unsafe { msg_send_id![super(this), init] }
+     }
+ 
++    /// With `init_before_finish_launching`: the default menu and the init events now, so the
++    /// app's first window is made and drawn before AppKit's own launch work (on macOS 27 about
++    /// 30,000 to 55,000 µs between this notification and `applicationDidFinishLaunching:`).
++    /// Only where `did_finish_launching` leaves the activation policy alone, a bundled app
++    /// that names none: any other app's windows wait for the policy it sets after the launch.
++    fn will_finish_launching(&self, _notification: &NSNotification) {
++        trace_scope!("applicationWillFinishLaunching:");
++        if !self.ivars().init_before_finish_launching
++            || self.ivars().activation_policy.is_some()
++            || self.ivars().stop_on_launch.get()
++        {
++            return;
++        }
++        let is_bundled =
++            unsafe { NSRunningApplication::currentApplication().bundleIdentifier().is_some() };
++        if !is_bundled {
++            return;
++        }
++        let mtm = MainThreadMarker::from(self);
++        let app = NSApplication::sharedApplication(mtm);
++        if self.ivars().default_menu {
++            menu::initialize(&app);
++        }
++        self.ivars().waker.borrow_mut().start();
++        self.set_is_running(true);
++        self.ivars().init_dispatched.set(true);
++        self.dispatch_init_events();
++    }
++
+     // NOTE: This will, globally, only be run once, no matter how many
+     // `EventLoop`s the user creates.
+     fn did_finish_launching(&self, _notification: &NSNotification) {
+@@ -136,16 +176,19 @@ impl ApplicationDelegate {
+         #[allow(deprecated)]
+         app.activateIgnoringOtherApps(self.ivars().activate_ignoring_other_apps);
+ 
+-        if self.ivars().default_menu {
+-            // The menubar initialization should be before the `NewEvents` event, to allow
+-            // overriding of the default menu even if it's created
+-            menu::initialize(&app);
+-        }
++        // `will_finish_launching` did the rest already.
++        if !self.ivars().init_dispatched.get() {
++            if self.ivars().default_menu {
++                // The menubar initialization should be before the `NewEvents` event, to allow
++                // overriding of the default menu even if it's created
++                menu::initialize(&app);
++            }
+ 
+-        self.ivars().waker.borrow_mut().start();
++            self.ivars().waker.borrow_mut().start();
+ 
+-        self.set_is_running(true);
+-        self.dispatch_init_events();
++            self.set_is_running(true);
++            self.dispatch_init_events();
++        }
+ 
+         // If the application is being launched via `EventLoop::pump_app_events()` then we'll
+         // want to stop the app once it is launched (and return to the external loop)
+diff --git a/src/platform_impl/macos/event_loop.rs b/src/platform_impl/macos/event_loop.rs
+index 5c093d5a1..7890d955d 100644
+--- a/src/platform_impl/macos/event_loop.rs
++++ b/src/platform_impl/macos/event_loop.rs
+@@ -205,11 +205,17 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
+     pub(crate) activation_policy: Option<ActivationPolicy>,
+     pub(crate) default_menu: bool,
+     pub(crate) activate_ignoring_other_apps: bool,
++    pub(crate) init_before_finish_launching: bool,
+ }
+ 
+ impl Default for PlatformSpecificEventLoopAttributes {
+     fn default() -> Self {
+-        Self { activation_policy: None, default_menu: true, activate_ignoring_other_apps: true }
++        Self {
++            activation_policy: None,
++            default_menu: true,
++            activate_ignoring_other_apps: true,
++            init_before_finish_launching: false,
++        }
+     }
+ }
+ 
+@@ -234,6 +240,7 @@ impl<T> EventLoop<T> {
+             activation_policy,
+             attributes.default_menu,
+             attributes.activate_ignoring_other_apps,
++            attributes.init_before_finish_launching,
+         );
+ 
+         autoreleasepool(|_| {
 diff --git a/src/platform_impl/macos/ime_text.rs b/src/platform_impl/macos/ime_text.rs
 new file mode 100644
-index 0000000..8725e96
+index 000000000..8725e9637
 --- /dev/null
 +++ b/src/platform_impl/macos/ime_text.rs
 @@ -0,0 +1,30 @@
@@ -115,22 +1457,26 @@ index 0000000..8725e96
 +    text[..byte.min(text.len())].encode_utf16().count()
 +}
 diff --git a/src/platform_impl/macos/mod.rs b/src/platform_impl/macos/mod.rs
-index 1b427a8..fff68ab 100644
+index 1b427a87d..1ef908d6c 100644
 --- a/src/platform_impl/macos/mod.rs
 +++ b/src/platform_impl/macos/mod.rs
-@@ -8,6 +8,7 @@ mod event;
+@@ -8,7 +8,8 @@ mod event;
  mod event_handler;
  mod event_loop;
  mod ffi;
-+pub(crate) mod ime_text;
 -mod menu;
++pub(crate) mod ime_text;
 +pub(crate) mod menu;
  mod monitor;
  mod observer;
+ mod view;
 diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
+index c7ca5bc6e..7cf31a200 100644
 --- a/src/platform_impl/macos/view.rs
 +++ b/src/platform_impl/macos/view.rs
-@@ -264,2 +264,12 @@ declare_class!(
+@@ -262,6 +262,16 @@ declare_class!(
+         #[method(selectedRange)]
+         fn selected_range(&self) -> NSRange {
              trace_scope!("selectedRange");
 +            // Rune: the app's selection in the text it published, so the input method can
 +            // reconvert it.
@@ -143,7 +1489,11 @@ diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
 +                }
 +            }
              // Documented to return `{NSNotFound, 0}` if there is no selection.
-@@ -273,7 +283,15 @@ declare_class!(
+             NSRange::new(NSNotFound as NSUInteger, 0)
+         }
+@@ -271,16 +281,27 @@ declare_class!(
+             &self,
+             string: &NSObject,
              selected_range: NSRange,
 -            _replacement_range: NSRange,
 +            replacement_range: NSRange,
@@ -161,19 +1511,27 @@ diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
 +            }
 +
              // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
-@@ -283,2 +301,5 @@ declare_class!(
+             let (marked_text, string) = if string.is_kind_of::<NSAttributedString>() {
+                 let string: *const NSObject = string;
+                 let string: *const NSAttributedString = string.cast();
                  let string = unsafe { &*string };
 +                // Rune: the clauses, by the input method's clause segments and underlines.
 +                let clauses = marked_clauses(string);
 +                super::ime_text::CLAUSES.with_borrow_mut(|c| *c = Some((string.string().to_string(), clauses)));
                  (
-@@ -356,3 +377,4 @@ declare_class!(
+                     NSMutableAttributedString::from_attributed_nsstring(string),
+                     string.string(),
+@@ -354,17 +375,30 @@ declare_class!(
+         #[method_id(validAttributesForMarkedText)]
+         fn valid_attributes_for_marked_text(&self) -> Retained<NSArray<NSAttributedStringKey>> {
              trace_scope!("validAttributesForMarkedText");
 -            NSArray::new()
 +            // Rune: the underline and clause segments, which carry a composition's clauses.
 +            NSArray::from_vec(vec![NSString::from_str("NSUnderline"), NSString::from_str("NSMarkedClauseSegment")])
          }
-@@ -362,7 +384,19 @@ declare_class!(
+ 
+         #[method_id(attributedSubstringForProposedRange:actualRange:)]
+         fn attributed_substring_for_proposed_range(
              &self,
 -            _range: NSRange,
 -            _actual_range: *mut NSRange,
@@ -196,7 +1554,11 @@ diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
 +                Some(NSAttributedString::from_nsstring(&NSString::from_str(&text[a..b])))
 +            })
          }
-@@ -823,3 +857,6 @@ impl WinitView {
+ 
+         #[method(characterIndexForPoint:)]
+@@ -821,7 +855,10 @@ impl WinitView {
+             )
+         }
  
 -        *this.ivars().input_source.borrow_mut() = this.current_input_source();
 +        // The input source is not read here: making the view's input context and asking the
@@ -204,7 +1566,11 @@ diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
 +        // compared only while the IME is enabled (`keyDown:`), and `setMarkedText:` reads it
 +        // as the IME becomes enabled.
  
-@@ -1142 +1179,30 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
+         this
+     }
+@@ -1140,3 +1177,32 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
+         event.copy()
+     }
  }
 +
 +/// Rune: a marked text's clauses, byte ranges with whether each is the one being converted: one
@@ -235,151 +1601,63 @@ diff --git a/src/platform_impl/macos/view.rs b/src/platform_impl/macos/view.rs
 +    }
 +    out
 +}
-diff --git a/src/platform_impl/windows/window.rs b/src/platform_impl/windows/window.rs
-index 228c6f0..1fcf1f2 100644
---- a/src/platform_impl/windows/window.rs
-+++ b/src/platform_impl/windows/window.rs
-@@ -1246,7 +1246,12 @@ impl InitData<'_> {
-             unsafe { DeleteObject(region) };
-         }
+diff --git a/src/platform_impl/macos/window_delegate.rs b/src/platform_impl/macos/window_delegate.rs
+index e293505eb..1da00acd2 100644
+--- a/src/platform_impl/macos/window_delegate.rs
++++ b/src/platform_impl/macos/window_delegate.rs
+@@ -778,6 +778,15 @@ impl WindowDelegate {
+         // obscure the real focused events on the startup.
+         delegate.queue_event(WindowEvent::Focused(false));
  
--        win.set_skip_taskbar(self.attributes.platform_specific.skip_taskbar);
-+        // A new window is on the taskbar already: only taking it off needs the TaskbarList COM
-+        // object (CoInitializeEx and CoCreateInstance on this thread, about 7,800 us and nine
-+        // shell DLLs before the window's first frame).
-+        if self.attributes.platform_specific.skip_taskbar {
-+            win.set_skip_taskbar(true);
++        // A window that opens maximized is zoomed before it is ordered front: `zoom:` animates
++        // a window on screen and returns only when the animation is over (about 260,000 µs),
++        // with the window on screen at its restored size meanwhile. A full screen window keeps
++        // its zoom for `window_did_exit_fullscreen`, as before.
++        let maximize_first = attrs.maximized && attrs.fullscreen.is_none();
++        if maximize_first {
++            delegate.set_maximized(true);
 +        }
-         win.set_window_icon(self.attributes.window_icon.clone());
-         win.set_taskbar_icon(self.attributes.platform_specific.taskbar_icon.clone());
++
+         // Set fullscreen mode after we setup everything
+         delegate.set_fullscreen(attrs.fullscreen.map(Into::into));
  
-@@ -1328,6 +1333,11 @@ unsafe fn init(
-     // Will be changed later using `window.set_enabled_buttons` but we need to set a default here
-     // so the diffing later can work.
-     window_flags.set(WindowFlags::CLOSABLE, true);
-+    // The window is made with the boxes it asks for, so `set_enabled_buttons` in `on_create`
-+    // changes nothing: adding them there rewrote its styles and changed its frame again
-+    // (`SWP_FRAMECHANGED`, about 1,000 us before its first frame).
-+    window_flags.set(WindowFlags::MINIMIZABLE, attributes.enabled_buttons.contains(WindowButtons::MINIMIZE));
-+    window_flags.set(WindowFlags::MAXIMIZABLE, attributes.enabled_buttons.contains(WindowButtons::MAXIMIZE));
-     window_flags.set(WindowFlags::CLIP_CHILDREN, attributes.platform_specific.clip_children);
- 
-     let mut fallback_parent = || match attributes.platform_specific.owner {
-@@ -1360,6 +1370,18 @@ unsafe fn init(
-     let menu = attributes.platform_specific.menu;
-     let fullscreen = attributes.fullscreen.clone();
-     let maximized = attributes.maximized;
-+    // A window with a physical position is made there, at its size, so it is born on its
-+    // display at that display's scale. Made at the default place (the primary display) and moved
-+    // there afterwards, it would cross to the other display's scale (WM_DPICHANGED) and be
-+    // resized to keep its logical size: a window saved on a 150 % display beside a 100 % primary
-+    // would reopen half as large again.
-+    let (x, y, width, height) = match (attributes.position, attributes.inner_size) {
-+        (Some(Position::Physical(p)), Some(Size::Physical(s))) => {
-+            (p.x, p.y, s.width as i32, s.height as i32)
-+        },
-+        (Some(Position::Physical(p)), _) => (p.x, p.y, CW_USEDEFAULT, CW_USEDEFAULT),
-+        _ => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
-+    };
-     let mut initdata = InitData { event_loop, attributes, window_flags, window: None };
- 
-     let (style, ex_style) = window_flags.to_window_styles();
-@@ -1369,10 +1391,10 @@ unsafe fn init(
-             class_name.as_ptr(),
-             title.as_ptr(),
-             style,
--            CW_USEDEFAULT,
--            CW_USEDEFAULT,
--            CW_USEDEFAULT,
--            CW_USEDEFAULT,
-+            x,
-+            y,
-+            width,
-+            height,
-             parent.unwrap_or(0),
-             menu.unwrap_or(0),
-             util::get_instance_handle(),
-diff --git a/src/platform_impl/windows/window_state.rs b/src/platform_impl/windows/window_state.rs
-index 8e24a4f..bfe251b 100644
---- a/src/platform_impl/windows/window_state.rs
-+++ b/src/platform_impl/windows/window_state.rs
-@@ -380,7 +380,9 @@ impl WindowFlags {
-             diff.remove(WindowFlags::MINIMIZED);
-         }
- 
--        if diff.contains(WindowFlags::CLOSABLE) || new.contains(WindowFlags::CLOSABLE) {
-+        // A new window's system menu has Close enabled: the menu (`GetSystemMenu` makes the
-+        // window its own copy, about 1,200 us before its first frame) is touched only to change it.
-+        if diff.contains(WindowFlags::CLOSABLE) && !(self.is_empty() && new.contains(WindowFlags::CLOSABLE)) {
-             let flags = MF_BYCOMMAND
-                 | if new.contains(WindowFlags::CLOSABLE) { MF_ENABLED } else { MF_DISABLED };
- 
-@@ -395,6 +397,12 @@ impl WindowFlags {
+@@ -793,7 +802,7 @@ impl WindowDelegate {
              }
          }
  
-+        // A show or a hide alone: ShowWindow set WS_VISIBLE itself. Writing the styles again and
-+        // refreshing the frame (SWP_FRAMECHANGED) cost a window's first show about 2,200 us.
-+        if diff == WindowFlags::VISIBLE {
-+            return;
-+        }
-+
-         if diff != WindowFlags::empty() {
-             let (style, style_ex) = new.to_window_styles();
+-        if attrs.maximized {
++        if attrs.maximized && !maximize_first {
+             delegate.set_maximized(attrs.maximized);
+         }
  
-diff --git a/src/platform/windows.rs b/src/platform/windows.rs
---- a/src/platform/windows.rs
-+++ b/src/platform/windows.rs
-@@ -13,6 +13,14 @@ use crate::monitor::MonitorHandle;
- use crate::window::{BadIcon, Icon, Window, WindowAttributes};
+diff --git a/src/platform_impl/windows/dark_mode.rs b/src/platform_impl/windows/dark_mode.rs
+index 366e44c68..67c4fc536 100644
+--- a/src/platform_impl/windows/dark_mode.rs
++++ b/src/platform_impl/windows/dark_mode.rs
+@@ -5,7 +5,9 @@ use std::{ffi::c_void, ptr};
+ use crate::utils::Lazy;
+ use windows_sys::core::PCSTR;
+ use windows_sys::Win32::Foundation::{BOOL, HWND, NTSTATUS, S_OK};
+-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
++use windows_sys::Win32::System::LibraryLoader::{
++    GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
++};
+ use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+ use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTA};
+ use windows_sys::Win32::UI::Controls::SetWindowTheme;
+@@ -138,7 +140,9 @@ fn should_apps_use_dark_mode() -> bool {
+             return None;
+         }
  
- /// Window Handle type used by Win32 API
-+/// Builds winit's keyboard-layout table for thread `thread_id`'s keyboard layout on the calling
-+/// thread, so the first key or mouse message that thread's windows handle doesn't build it (8-10
-+/// ms, every virtual key through `ToUnicodeEx`). Call it on a thread of its own at launch with
-+/// the UI thread's id.
-+pub fn warm_keyboard_layout(thread_id: u32) {
-+    crate::platform_impl::warm_layout(thread_id);
-+}
-+
- pub type HWND = isize;
- /// Menu Handle type used by Win32 API
- pub type HMENU = isize;
-diff --git a/src/platform_impl/windows/keyboard_layout.rs b/src/platform_impl/windows/keyboard_layout.rs
---- a/src/platform_impl/windows/keyboard_layout.rs
-+++ b/src/platform_impl/windows/keyboard_layout.rs
-@@ -48,6 +48,18 @@ use crate::platform_impl::{loword, primarylangid, scancode_to_physicalkey};
- pub(crate) static LAYOUT_CACHE: Lazy<Mutex<LayoutCache>> =
-     Lazy::new(|| Mutex::new(LayoutCache::default()));
+-        let module = LoadLibraryA("uxtheme.dll\0".as_ptr().cast());
++        // Rune: load uxtheme.dll from System32 only, not the app directory or CWD.
++        let module =
++            LoadLibraryExA("uxtheme.dll\0".as_ptr().cast(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
  
-+/// Builds the layout cache's entry for the keyboard layout of thread `thread`, on the calling
-+/// thread. The first key or mouse message a window's thread handles builds it otherwise (every
-+/// virtual key through `ToUnicodeEx`, 8-10 ms), so a window's first input waited for it.
-+pub(crate) fn warm_layout(thread: u32) {
-+    let hkl = unsafe { GetKeyboardLayout(thread) } as u64;
-+    if LAYOUT_CACHE.lock().unwrap().layouts.contains_key(&hkl) {
-+        return;
-+    }
-+    let layout = LayoutCache::prepare_layout(hkl);
-+    LAYOUT_CACHE.lock().unwrap().layouts.entry(hkl).or_insert(layout);
-+}
-+
- fn key_pressed(vkey: VIRTUAL_KEY) -> bool {
-     unsafe { (GetKeyState(vkey as i32) & (1 << 15)) == (1 << 15) }
- }
-diff --git a/src/platform_impl/windows/mod.rs b/src/platform_impl/windows/mod.rs
---- a/src/platform_impl/windows/mod.rs
-+++ b/src/platform_impl/windows/mod.rs
-@@ -8,6 +8,7 @@ pub(crate) use self::event_loop::{
- };
- pub(crate) use self::icon::{SelectedCursor, WinIcon};
- pub(crate) use self::keyboard::{physicalkey_to_scancode, scancode_to_physicalkey};
-+pub(crate) use self::keyboard_layout::warm_layout;
- pub(crate) use self::monitor::{MonitorHandle, VideoModeHandle};
- pub(crate) use self::window::Window;
- 
+         if module == 0 {
+             return None;
 diff --git a/src/platform_impl/windows/event_loop.rs b/src/platform_impl/windows/event_loop.rs
-index 6d60c1c5..c386d644 100644
+index 6d60c1c52..a8181f950 100644
 --- a/src/platform_impl/windows/event_loop.rs
 +++ b/src/platform_impl/windows/event_loop.rs
 @@ -18,8 +18,9 @@ use crate::utils::Lazy;
@@ -440,228 +1718,84 @@ index 6d60c1c5..c386d644 100644
          for event in events {
              userdata.send_event(Event::WindowEvent {
                  window_id: RootWindowId(WindowId(window)),
-diff --git a/src/platform/wayland.rs b/src/platform/wayland.rs
-index 9c1a8e4..63c0a92 100644
---- a/src/platform/wayland.rs
-+++ b/src/platform/wayland.rs
-@@ -81,6 +81,23 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
- pub trait WindowExtWayland {
-     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
-     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
-+
-+    /// Rune: the radius, in logical points, of the arc the window's content takes at its bottom
-+    /// corners. A client-side frame (`sctk-adwaita`) draws a one-point border around the window
-+    /// and rounds its corners while it floats, so the content's own square corners would show
-+    /// past it.
-+    ///
-+    /// Zero when the frame draws the window square (maximized or tiled), when no client-side
-+    /// frame is drawn (server side decorations, or decorations off), and on X11.
-+    fn content_corner_radius(&self) -> f32;
-+
-+    /// Rune: whether a client-side frame draws the window's decorations, true whatever state the
-+    /// frame is in: a maximized, tiled or fullscreen window keeps its frame, which hides parts of
-+    /// itself rather than going away.
-+    ///
-+    /// False when the compositor draws the decorations, when decorations are off, when no frame
-+    /// could be made, and on X11.
-+    fn has_client_side_frame(&self) -> bool;
- }
+@@ -1217,35 +1238,47 @@ unsafe fn public_window_callback_inner(
+         },
  
- impl WindowExtWayland for Window {
-@@ -94,6 +111,28 @@ impl WindowExtWayland for Window {
-             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
-         }
-     }
-+
-+    #[inline]
-+    fn content_corner_radius(&self) -> f32 {
-+        #[allow(clippy::single_match)]
-+        match &self.window {
-+            #[cfg(x11_platform)]
-+            crate::platform_impl::Window::X(_) => 0.,
-+            #[cfg(wayland_platform)]
-+            crate::platform_impl::Window::Wayland(window) => window.content_corner_radius(),
-+        }
-+    }
-+
-+    #[inline]
-+    fn has_client_side_frame(&self) -> bool {
-+        #[allow(clippy::single_match)]
-+        match &self.window {
-+            #[cfg(x11_platform)]
-+            crate::platform_impl::Window::X(_) => false,
-+            #[cfg(wayland_platform)]
-+            crate::platform_impl::Window::Wayland(window) => window.has_client_side_frame(),
-+        }
-+    }
- }
+         WM_NCLBUTTONDOWN => {
+-            if wparam == HTCAPTION as _ {
+-                // Prevent the user event loop from pausing when left clicking the title bar.
+-                //
+-                // When the user interacts with the title bar, Windows enters the modal event
+-                // loop. Currently, a left click causes a pause for about 500ms. Sending a dummy
+-                // mouse-move event seems to cancel the modal loop early, preventing the pause.
+-                // The application will never see this dummy event.
+-                //
+-                // The mouse coordinates are encoded into the lparam value, however the WM_MOUSEMOVE
+-                // event is not using the same coordinate system of the WM_NCLBUTTONDOWN event.
+-                // One uses client-area coordinates and the other is screen-coordinates. In any
+-                // case, passing the lparam as-is with the dummy event does not seem the cancel
+-                // the modal loop.
+-                //
+-                // However, passing in a value of 0 has been observed to always cancel the pause.
+-                //
+-                // Other notes:
+-                //
+-                // For some unknown reason, the cursor will blink when clicking the title bar.
+-                // Cancelling the modal loop early causes the blink to happen *immediately*.
+-                // Otherwise, the blank happens *after* the pause.
+-                //
+-                // When right-click the title bar, the system window menu is presented to the user,
+-                // and the modal event loop begins. This dummy event does *not* prevent the freeze
+-                // in the main event loop caused by that popup menu.
+-                let lparam = 0;
+-                unsafe { PostMessageW(window, WM_MOUSEMOVE, 0, lparam) };
++            if userdata.window_state_lock().dragging {
++                let res = unsafe { DefWindowProcW(window, msg, wparam, lparam) };
++                let mut state = userdata.window_state_lock();
++                if state.dragging {
++                    state.dragging = false;
++                    if !userdata.userdata_removed.get() {
++                        unsafe { PostMessageW(window, WM_LBUTTONUP, 0, lparam) };
++                    }
++                }
++                result = ProcResult::Value(res);
++            } else {
++                if wparam == HTCAPTION as _ {
++                    // Prevent the user event loop from pausing when left clicking the title bar.
++                    //
++                    // When the user interacts with the title bar, Windows enters the modal event
++                    // loop. Currently, a left click causes a pause for about 500ms. Sending a dummy
++                    // mouse-move event seems to cancel the modal loop early, preventing the pause.
++                    // The application will never see this dummy event.
++                    //
++                    // The mouse coordinates are encoded into the lparam value, however the WM_MOUSEMOVE
++                    // event is not using the same coordinate system of the WM_NCLBUTTONDOWN event.
++                    // One uses client-area coordinates and the other is screen-coordinates. In any
++                    // case, passing the lparam as-is with the dummy event does not seem the cancel
++                    // the modal loop.
++                    //
++                    // However, passing in a value of 0 has been observed to always cancel the pause.
++                    //
++                    // Other notes:
++                    //
++                    // For some unknown reason, the cursor will blink when clicking the title bar.
++                    // Cancelling the modal loop early causes the blink to happen *immediately*.
++                    // Otherwise, the blank happens *after* the pause.
++                    //
++                    // When right-click the title bar, the system window menu is presented to the user,
++                    // and the modal event loop begins. This dummy event does *not* prevent the freeze
++                    // in the main event loop caused by that popup menu.
++                    let lparam = 0;
++                    unsafe { PostMessageW(window, WM_MOUSEMOVE, 0, lparam) };
++                }
++                result = ProcResult::DefWindowProc(wparam);
+             }
+-            result = ProcResult::DefWindowProc(wparam);
+         },
  
- /// Additional methods on [`WindowAttributes`] that are specific to Wayland.
-diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
-index 6d29a5a..2418b6f 100644
---- a/src/platform_impl/linux/wayland/window/mod.rs
-+++ b/src/platform_impl/linux/wayland/window/mod.rs
-@@ -426,6 +426,18 @@ impl Window {
-         self.window_state.lock().unwrap().is_decorated()
-     }
- 
-+    /// Rune: see `WindowExtWayland::content_corner_radius`.
-+    #[inline]
-+    pub fn content_corner_radius(&self) -> f32 {
-+        self.window_state.lock().unwrap().content_corner_radius()
-+    }
-+
-+    /// Rune: see `WindowExtWayland::has_client_side_frame`.
-+    #[inline]
-+    pub fn has_client_side_frame(&self) -> bool {
-+        self.window_state.lock().unwrap().has_client_side_frame()
-+    }
-+
-     #[inline]
-     pub fn set_window_level(&self, _level: WindowLevel) {}
- 
-diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
-index 1ef7a06..9cd83c4 100644
---- a/src/platform_impl/linux/wayland/window/state.rs
-+++ b/src/platform_impl/linux/wayland/window/state.rs
-@@ -398,6 +398,10 @@ impl WindowState {
-             self.resize(new_size);
-             true
-         } else {
-+            // Rune: the frame may have appeared or gone, or turned square, and no resize follows to
-+            // tell the compositor: the opaque region follows it now that it knows this configure's
-+            // state.
-+            self.reload_transparency_hint();
-             false
-         }
-     }
-@@ -599,6 +603,38 @@ impl WindowState {
-         }
-     }
- 
-+    /// Rune: whether a client-side frame draws the window's decorations, whatever state it is in:
-+    /// a maximized, tiled or fullscreen window keeps its frame (it draws square corners there),
-+    /// which only hides parts of itself. False when the compositor draws the decorations, when
-+    /// decorations are off, and when the frame could not be made (no subcompositor, or a frame that
-+    /// failed to build).
-+    #[inline]
-+    pub fn has_client_side_frame(&self) -> bool {
-+        self.decorate
-+            && self
-+                .last_configure
-+                .as_ref()
-+                .is_some_and(|configure| configure.decoration_mode == DecorationMode::Client)
-+            && self.frame.is_some()
-+    }
-+
-+    /// Rune: the radius, in logical points, of the arc the window's content takes at its bottom
-+    /// corners, which the client-side frame leaves it (the frame's visible border lies just
-+    /// outside it). Zero when no client-side frame is drawn, and when the frame draws the window
-+    /// square: maximized, tiled or fullscreen.
-+    #[inline]
-+    pub fn content_corner_radius(&self) -> f32 {
-+        #[cfg(feature = "sctk-adwaita")]
-+        if let Some(frame) = self
-+            .frame
-+            .as_ref()
-+            .filter(|frame| self.decorate && !frame.is_hidden())
-+        {
-+            return frame.content_corner_radius();
-+        }
-+        0.
-+    }
-+
-     /// Get the outer size of the window.
-     #[inline]
-     pub fn outer_size(&self) -> LogicalSize<u32> {
-@@ -655,17 +691,31 @@ impl WindowState {
-     }
- 
-     /// Reissue the transparency hint to the compositor.
-+    ///
-+    /// Rune: a client-side frame that rounds the content's bottom corners leaves the two corner
-+    /// squares to the compositor, so an opaque window keeps the rest of itself opaque instead of
-+    /// blending all of it.
-     pub fn reload_transparency_hint(&self) {
-         let surface = self.window.wl_surface();
- 
-         if self.transparent {
-             surface.set_opaque_region(None);
--        } else if let Ok(region) = Region::new(&*self.compositor) {
-+            return;
-+        }
-+        let Ok(region) = Region::new(&*self.compositor) else {
-+            warn!("Failed to mark window opaque.");
-+            return;
-+        };
-+        let radius = self.content_corner_radius() as i32;
-+        let (width, height) = (self.size.width as i32, self.size.height as i32);
-+        if radius <= 0 || width <= 2 * radius || height <= radius {
-             region.add(0, 0, i32::MAX, i32::MAX);
--            surface.set_opaque_region(Some(region.wl_region()));
-         } else {
--            warn!("Failed to mark window opaque.");
-+            // Everything but the two squares the frame's arcs cross at the window's foot.
-+            region.add(0, 0, width, height - radius);
-+            region.add(radius, height - radius, width - 2 * radius, radius);
-         }
-+        surface.set_opaque_region(Some(region.wl_region()));
-     }
- 
-     /// Try to resize the window when the user can do so.
-diff --git a/src/platform_impl/windows/dark_mode.rs b/src/platform_impl/windows/dark_mode.rs
-index 366e44c6..67c4fc53 100644
---- a/src/platform_impl/windows/dark_mode.rs
-+++ b/src/platform_impl/windows/dark_mode.rs
-@@ -5,7 +5,9 @@ use std::{ffi::c_void, ptr};
- use crate::utils::Lazy;
- use windows_sys::core::PCSTR;
- use windows_sys::Win32::Foundation::{BOOL, HWND, NTSTATUS, S_OK};
--use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-+use windows_sys::Win32::System::LibraryLoader::{
-+    GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
-+};
- use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
- use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTA};
- use windows_sys::Win32::UI::Controls::SetWindowTheme;
-@@ -138,7 +140,9 @@ fn should_apps_use_dark_mode() -> bool {
-             return None;
-         }
- 
--        let module = LoadLibraryA("uxtheme.dll\0".as_ptr().cast());
-+        // Rune: load uxtheme.dll from System32 only, not the app directory or CWD.
-+        let module =
-+            LoadLibraryExA("uxtheme.dll\0".as_ptr().cast(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
- 
-         if module == 0 {
-             return None;
-diff --git a/src/platform_impl/windows/util.rs b/src/platform_impl/windows/util.rs
-index a3a7705d..c3980673 100644
---- a/src/platform_impl/windows/util.rs
-+++ b/src/platform_impl/windows/util.rs
-@@ -9,7 +9,9 @@ use crate::utils::Lazy;
- use windows_sys::core::{HRESULT, PCWSTR};
- use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, HWND, POINT, RECT};
- use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HMONITOR};
--use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-+use windows_sys::Win32::System::LibraryLoader::{
-+    GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
-+};
- use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
- use windows_sys::Win32::UI::HiDpi::{
-     DPI_AWARENESS_CONTEXT, MONITOR_DPI_TYPE, PROCESS_DPI_AWARENESS,
-@@ -195,7 +197,8 @@ pub(super) fn get_function_impl(library: &str, function: &str) -> Option<*const
-     assert_eq!(function.chars().last(), Some('\0'));
- 
-     // Library names we will use are ASCII so we can use the A version to avoid string conversion.
--    let module = unsafe { LoadLibraryA(library.as_ptr()) };
-+    // Rune: load Windows system DLLs from System32 only, not the app directory or CWD.
-+    let module = unsafe { LoadLibraryExA(library.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32) };
-     if module == 0 {
-         return None;
-     }
+         WM_CLOSE => {
 diff --git a/src/platform_impl/windows/keyboard.rs b/src/platform_impl/windows/keyboard.rs
-index 9c109490..705976d6 100644
+index 9c109490e..705976d64 100644
 --- a/src/platform_impl/windows/keyboard.rs
 +++ b/src/platform_impl/windows/keyboard.rs
 @@ -4,7 +4,9 @@ use std::mem::MaybeUninit;
@@ -1496,588 +2630,68 @@ index 9c109490..705976d6 100644
  #[derive(Debug, Copy, Clone)]
  struct KeyLParam {
      pub scancode: u8,
-diff --git a/src/platform_impl/macos/app_state.rs b/src/platform_impl/macos/app_state.rs
---- a/src/platform_impl/macos/app_state.rs
-+++ b/src/platform_impl/macos/app_state.rs
-@@ -25,2 +25,5 @@ pub(super) struct AppState {
-     activate_ignoring_other_apps: bool,
-+    init_before_finish_launching: bool,
-+    /// Whether `applicationWillFinishLaunching:` dispatched the init events.
-+    init_dispatched: Cell<bool>,
-     run_loop: RunLoop,
-@@ -63,2 +66,7 @@ declare_class!(
-     unsafe impl NSApplicationDelegate for ApplicationDelegate {
-+        #[method(applicationWillFinishLaunching:)]
-+        fn app_will_finish_launching(&self, notification: &NSNotification) {
-+            self.will_finish_launching(notification)
-+        }
-+
-         #[method(applicationDidFinishLaunching:)]
-@@ -81,2 +89,3 @@ impl ApplicationDelegate {
-         activate_ignoring_other_apps: bool,
-+        init_before_finish_launching: bool,
-     ) -> Retained<Self> {
-@@ -86,2 +95,4 @@ impl ApplicationDelegate {
-             activate_ignoring_other_apps,
-+            init_before_finish_launching,
-+            init_dispatched: Cell::new(false),
-             run_loop: RunLoop::main(mtm),
-@@ -104,2 +115,31 @@ impl ApplicationDelegate {
+diff --git a/src/platform_impl/windows/keyboard_layout.rs b/src/platform_impl/windows/keyboard_layout.rs
+index 5340e43d8..6b4488b58 100644
+--- a/src/platform_impl/windows/keyboard_layout.rs
++++ b/src/platform_impl/windows/keyboard_layout.rs
+@@ -48,6 +48,18 @@ use crate::platform_impl::{loword, primarylangid, scancode_to_physicalkey};
+ pub(crate) static LAYOUT_CACHE: Lazy<Mutex<LayoutCache>> =
+     Lazy::new(|| Mutex::new(LayoutCache::default()));
  
-+    /// With `init_before_finish_launching`: the default menu and the init events now, so the
-+    /// app's first window is made and drawn before AppKit's own launch work (on macOS 27 about
-+    /// 30,000 to 55,000 µs between this notification and `applicationDidFinishLaunching:`).
-+    /// Only where `did_finish_launching` leaves the activation policy alone, a bundled app
-+    /// that names none: any other app's windows wait for the policy it sets after the launch.
-+    fn will_finish_launching(&self, _notification: &NSNotification) {
-+        trace_scope!("applicationWillFinishLaunching:");
-+        if !self.ivars().init_before_finish_launching
-+            || self.ivars().activation_policy.is_some()
-+            || self.ivars().stop_on_launch.get()
-+        {
-+            return;
-+        }
-+        let is_bundled =
-+            unsafe { NSRunningApplication::currentApplication().bundleIdentifier().is_some() };
-+        if !is_bundled {
-+            return;
-+        }
-+        let mtm = MainThreadMarker::from(self);
-+        let app = NSApplication::sharedApplication(mtm);
-+        if self.ivars().default_menu {
-+            menu::initialize(&app);
-+        }
-+        self.ivars().waker.borrow_mut().start();
-+        self.set_is_running(true);
-+        self.ivars().init_dispatched.set(true);
-+        self.dispatch_init_events();
++/// Builds the layout cache's entry for the keyboard layout of thread `thread`, on the calling
++/// thread. The first key or mouse message a window's thread handles builds it otherwise (every
++/// virtual key through `ToUnicodeEx`, 8-10 ms), so a window's first input waited for it.
++pub(crate) fn warm_layout(thread: u32) {
++    let hkl = unsafe { GetKeyboardLayout(thread) } as u64;
++    if LAYOUT_CACHE.lock().unwrap().layouts.contains_key(&hkl) {
++        return;
 +    }
-+
-     // NOTE: This will, globally, only be run once, no matter how many
-@@ -138,12 +178,15 @@ impl ApplicationDelegate {
- 
--        if self.ivars().default_menu {
--            // The menubar initialization should be before the `NewEvents` event, to allow
--            // overriding of the default menu even if it's created
--            menu::initialize(&app);
--        }
-+        // `will_finish_launching` did the rest already.
-+        if !self.ivars().init_dispatched.get() {
-+            if self.ivars().default_menu {
-+                // The menubar initialization should be before the `NewEvents` event, to allow
-+                // overriding of the default menu even if it's created
-+                menu::initialize(&app);
-+            }
- 
--        self.ivars().waker.borrow_mut().start();
-+            self.ivars().waker.borrow_mut().start();
- 
--        self.set_is_running(true);
--        self.dispatch_init_events();
-+            self.set_is_running(true);
-+            self.dispatch_init_events();
-+        }
- 
-diff --git a/src/platform_impl/macos/event_loop.rs b/src/platform_impl/macos/event_loop.rs
---- a/src/platform_impl/macos/event_loop.rs
-+++ b/src/platform_impl/macos/event_loop.rs
-@@ -207,2 +207,3 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
-     pub(crate) activate_ignoring_other_apps: bool,
-+    pub(crate) init_before_finish_launching: bool,
- }
-@@ -211,3 +212,8 @@ impl Default for PlatformSpecificEventLoopAttributes {
-     fn default() -> Self {
--        Self { activation_policy: None, default_menu: true, activate_ignoring_other_apps: true }
-+        Self {
-+            activation_policy: None,
-+            default_menu: true,
-+            activate_ignoring_other_apps: true,
-+            init_before_finish_launching: false,
-+        }
-     }
-@@ -236,2 +242,3 @@ impl<T> EventLoop<T> {
-             attributes.activate_ignoring_other_apps,
-+            attributes.init_before_finish_launching,
-         );
-diff --git a/src/platform_impl/macos/window_delegate.rs b/src/platform_impl/macos/window_delegate.rs
---- a/src/platform_impl/macos/window_delegate.rs
-+++ b/src/platform_impl/macos/window_delegate.rs
-@@ -780,2 +780,11 @@ impl WindowDelegate {
- 
-+        // A window that opens maximized is zoomed before it is ordered front: `zoom:` animates
-+        // a window on screen and returns only when the animation is over (about 260,000 µs),
-+        // with the window on screen at its restored size meanwhile. A full screen window keeps
-+        // its zoom for `window_did_exit_fullscreen`, as before.
-+        let maximize_first = attrs.maximized && attrs.fullscreen.is_none();
-+        if maximize_first {
-+            delegate.set_maximized(true);
-+        }
-+
-         // Set fullscreen mode after we setup everything
-@@ -795,3 +804,3 @@ impl WindowDelegate {
- 
--        if attrs.maximized {
-+        if attrs.maximized && !maximize_first {
-             delegate.set_maximized(attrs.maximized);
-diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
-index 13ef99c26..27b73b6a4 100644
---- a/src/platform_impl/linux/wayland/state.rs
-+++ b/src/platform_impl/linux/wayland/state.rs
-@@ -123,6 +123,19 @@ impl WinitState {
-         queue_handle: &QueueHandle<Self>,
-         loop_handle: LoopHandle<'static, WinitState>,
-     ) -> Result<Self, OsError> {
-+        // A compositor without the decoration protocol answers a decorated window's first
-+        // configure with a client-side frame, and that frame reads the system's colour scheme and
-+        // button layout through two `dbus-send` processes, 100 ms of reply timeout each. Started
-+        // here, on threads of their own, they are done (or well on their way) when the configure
-+        // asks, instead of running one after the other on this thread before the first frame.
-+        #[cfg(feature = "sctk-adwaita")]
-+        if !globals
-+            .contents()
-+            .with_list(|list| list.iter().any(|global| global.interface == "zxdg_decoration_manager_v1"))
-+        {
-+            sctk_adwaita::read_system_config_early();
-+        }
-+
-         let registry_state = RegistryState::new(globals);
-         let compositor_state =
-             CompositorState::bind(globals, queue_handle).map_err(WaylandError::Bind)?;
-diff --git a/src/platform_impl/linux/wayland/seat/touch/mod.rs b/src/platform_impl/linux/wayland/seat/touch/mod.rs
-index 124504fee..86dc8b4e8 100644
---- a/src/platform_impl/linux/wayland/seat/touch/mod.rs
-+++ b/src/platform_impl/linux/wayland/seat/touch/mod.rs
-@@ -21,15 +21,15 @@ impl TouchHandler for WinitState {
-         _: &Connection,
-         _: &QueueHandle<Self>,
-         touch: &WlTouch,
--        _: u32,
-+        serial: u32,
-         _: u32,
-         surface: WlSurface,
-         id: i32,
-         position: (f64, f64),
-     ) {
-         let window_id = wayland::make_wid(&surface);
--        let scale_factor = match self.windows.get_mut().get(&window_id) {
--            Some(window) => window.lock().unwrap().scale_factor(),
-+        let window = match self.windows.get_mut().get(&window_id) {
-+            Some(window) => window.clone(),
-             None => return,
-         };
- 
-@@ -41,6 +41,12 @@ impl TouchHandler for WinitState {
-             },
-         };
- 
-+        let scale_factor = {
-+            let mut window = window.lock().unwrap();
-+            window.touch_down(id, touch.seat().clone(), serial);
-+            window.scale_factor()
-+        };
-+
-         // Update the state of the point.
-         let location = LogicalPosition::<f64>::from(position);
-         seat_state.touch_map.insert(id, TouchPoint { surface, location });
-@@ -84,7 +90,11 @@ impl TouchHandler for WinitState {
- 
-         let window_id = wayland::make_wid(&touch_point.surface);
-         let scale_factor = match self.windows.get_mut().get(&window_id) {
--            Some(window) => window.lock().unwrap().scale_factor(),
-+            Some(window) => {
-+                let mut window = window.lock().unwrap();
-+                window.touch_up(id, touch.seat());
-+                window.scale_factor()
-+            },
-             None => return,
-         };
- 
-@@ -159,7 +169,11 @@ impl TouchHandler for WinitState {
-         for (id, touch_point) in seat_state.touch_map.drain() {
-             let window_id = wayland::make_wid(&touch_point.surface);
-             let scale_factor = match self.windows.get_mut().get(&window_id) {
--                Some(window) => window.lock().unwrap().scale_factor(),
-+                Some(window) => {
-+                    let mut window = window.lock().unwrap();
-+                    window.touch_up(id, touch.seat());
-+                    window.scale_factor()
-+                },
-                 None => return,
-             };
- 
-diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
-index 9cd83c4a3..077451053 100644
---- a/src/platform_impl/linux/wayland/window/state.rs
-+++ b/src/platform_impl/linux/wayland/window/state.rs
-@@ -69,6 +69,9 @@ pub struct WindowState {
-     /// The pointers observed on the window.
-     pub pointers: Vec<Weak<ThemedPointer<WinitPointerData>>>,
- 
-+    /// Rune: active touches on the window, for interactive move/resize/menu serials.
-+    active_touches: ActiveTouches<WlSeat>,
-+
-     selected_cursor: SelectedCursor,
- 
-     /// Whether the cursor is visible.
-@@ -206,6 +209,7 @@ impl WindowState {
-             resize_increments: None,
-             pointer_constraints,
-             pointers: Default::default(),
-+            active_touches: ActiveTouches::default(),
-             queue_handle: queue_handle.clone(),
-             resizable: true,
-             scale_factor: 1.,
-@@ -234,6 +238,28 @@ impl WindowState {
-         })
-     }
- 
-+    /// Rune: record an active touch down on this window.
-+    pub fn touch_down(&mut self, id: i32, seat: WlSeat, serial: u32) {
-+        self.active_touches.down(id, seat, serial);
-+    }
-+
-+    /// Rune: clear a touch point that ended or was cancelled on this window.
-+    pub fn touch_up(&mut self, id: i32, seat: &WlSeat) {
-+        self.active_touches.up(id, seat);
-+    }
-+
-+    /// Rune: run an interactive xdg-shell request using the active touch's `(seat, serial)`,
-+    /// falling back to the observed pointers' latest button serial when no touch is down.
-+    fn with_interactive_serial(&self, mut callback: impl FnMut(&WlSeat, u32)) {
-+        if let Some((seat, serial)) = self.active_touches.latest() {
-+            callback(seat, serial);
-+            return;
-+        }
-+        self.apply_on_pointer(|_, data| {
-+            callback(data.seat(), data.latest_button_serial());
-+        });
-+    }
-+
-     /// Get the current state of the frame callback.
-     pub fn frame_callback_state(&self) -> FrameCallbackState {
-         self.frame_callback_state
-@@ -435,11 +461,7 @@ impl WindowState {
-     /// Start interacting drag resize.
-     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
-         let xdg_toplevel = self.window.xdg_toplevel();
--
--        // TODO(kchibisov) handle touch serials.
--        self.apply_on_pointer(|_, data| {
--            let serial = data.latest_button_serial();
--            let seat = data.seat();
-+        self.with_interactive_serial(|seat, serial| {
-             xdg_toplevel.resize(seat, serial, direction.into());
-         });
- 
-@@ -449,10 +471,7 @@ impl WindowState {
-     /// Start the window drag.
-     pub fn drag_window(&self) -> Result<(), ExternalError> {
-         let xdg_toplevel = self.window.xdg_toplevel();
--        // TODO(kchibisov) handle touch serials.
--        self.apply_on_pointer(|_, data| {
--            let serial = data.latest_button_serial();
--            let seat = data.seat();
-+        self.with_interactive_serial(|seat, serial| {
-             xdg_toplevel._move(seat, serial);
-         });
- 
-@@ -982,10 +1001,7 @@ impl WindowState {
-     }
- 
-     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
--        // TODO(kchibisov) handle touch serials.
--        self.apply_on_pointer(|_, data| {
--            let serial = data.latest_button_serial();
--            let seat = data.seat();
-+        self.with_interactive_serial(|seat, serial| {
-             self.window.show_window_menu(seat, serial, position.into());
-         });
-     }
-@@ -1268,3 +1284,58 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
-         None => sctk_adwaita::FrameConfig::auto(),
-     }
- }
-+
-+/// Rune: active touches on a window `(id, seat, down_serial)` in arrival order.
-+#[derive(Debug)]
-+struct ActiveTouches<S> {
-+    points: Vec<(i32, S, u32)>,
++    let layout = LayoutCache::prepare_layout(hkl);
++    LAYOUT_CACHE.lock().unwrap().layouts.entry(hkl).or_insert(layout);
 +}
 +
-+impl<S> Default for ActiveTouches<S> {
-+    fn default() -> Self {
-+        Self { points: Vec::new() }
-+    }
-+}
-+
-+impl<S: PartialEq> ActiveTouches<S> {
-+    fn down(&mut self, id: i32, seat: S, serial: u32) {
-+        self.points.retain(|(i, s, _)| !(*i == id && *s == seat));
-+        self.points.push((id, seat, serial));
-+    }
-+
-+    fn up(&mut self, id: i32, seat: &S) {
-+        self.points.retain(|(i, s, _)| !(*i == id && s == seat));
-+    }
-+
-+    fn latest(&self) -> Option<(&S, u32)> {
-+        self.points.last().map(|(_, seat, serial)| (seat, *serial))
-+    }
-+}
-+
-+#[cfg(test)]
-+mod touch_serial_tests {
-+    use super::ActiveTouches;
-+
-+    #[test]
-+    fn active_touch_serial_tracks_down_up_and_multitouch() {
-+        let mut touches = ActiveTouches::default();
-+        assert_eq!(touches.latest(), None);
-+
-+        touches.down(0, "seat0", 41);
-+        assert_eq!(touches.latest(), Some((&"seat0", 41)));
-+
-+        // Second finger down becomes latest; lifting it restores the first finger's serial.
-+        touches.down(1, "seat0", 42);
-+        assert_eq!(touches.latest(), Some((&"seat0", 42)));
-+        touches.up(1, &"seat0");
-+        assert_eq!(touches.latest(), Some((&"seat0", 41)));
-+
-+        // Duplicate id on the same seat updates its serial without duplicating entries.
-+        touches.down(0, "seat0", 43);
-+        assert_eq!(touches.latest(), Some((&"seat0", 43)));
-+
-+        // Lifting the last finger returns None so callers fall back to pointer serials.
-+        touches.up(0, &"seat0");
-+        assert_eq!(touches.latest(), None);
-+    }
-+}
-diff --git a/src/platform/wayland.rs b/src/platform/wayland.rs
-index 63c0a922d..7b22e69f0 100644
---- a/src/platform/wayland.rs
-+++ b/src/platform/wayland.rs
-@@ -27,6 +27,12 @@ pub use crate::window::Theme;
- pub trait ActiveEventLoopExtWayland {
-     /// True if the [`ActiveEventLoop`] uses Wayland.
-     fn is_wayland(&self) -> bool;
-+
-+    /// Rune: when `wake` is true, any successful Wayland display read marks the event loop as
-+    /// having dispatched events so `ControlFlow::Wait` runs a turn even when winit's own queues
-+    /// had no events. Foreign Wayland queues sharing the display (such as layer-shell overlays)
-+    /// dispatch on that turn without background reader threads. Off by default; no-op on X11.
-+    fn set_wake_on_wayland_read(&self, wake: bool);
+ fn key_pressed(vkey: VIRTUAL_KEY) -> bool {
+     unsafe { (GetKeyState(vkey as i32) & (1 << 15)) == (1 << 15) }
  }
+diff --git a/src/platform_impl/windows/mod.rs b/src/platform_impl/windows/mod.rs
+index 9bb02fd4e..89a61a224 100644
+--- a/src/platform_impl/windows/mod.rs
++++ b/src/platform_impl/windows/mod.rs
+@@ -8,6 +8,7 @@ pub(crate) use self::event_loop::{
+ };
+ pub(crate) use self::icon::{SelectedCursor, WinIcon};
+ pub(crate) use self::keyboard::{physicalkey_to_scancode, scancode_to_physicalkey};
++pub(crate) use self::keyboard_layout::warm_layout;
+ pub(crate) use self::monitor::{MonitorHandle, VideoModeHandle};
+ pub(crate) use self::window::Window;
  
- impl ActiveEventLoopExtWayland for ActiveEventLoop {
-@@ -34,6 +40,11 @@ impl ActiveEventLoopExtWayland for ActiveEventLoop {
-     fn is_wayland(&self) -> bool {
-         self.p.is_wayland()
+diff --git a/src/platform_impl/windows/util.rs b/src/platform_impl/windows/util.rs
+index a3a7705d2..c39806733 100644
+--- a/src/platform_impl/windows/util.rs
++++ b/src/platform_impl/windows/util.rs
+@@ -9,7 +9,9 @@ use crate::utils::Lazy;
+ use windows_sys::core::{HRESULT, PCWSTR};
+ use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, HWND, POINT, RECT};
+ use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HMONITOR};
+-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
++use windows_sys::Win32::System::LibraryLoader::{
++    GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
++};
+ use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+ use windows_sys::Win32::UI::HiDpi::{
+     DPI_AWARENESS_CONTEXT, MONITOR_DPI_TYPE, PROCESS_DPI_AWARENESS,
+@@ -195,7 +197,8 @@ pub(super) fn get_function_impl(library: &str, function: &str) -> Option<*const
+     assert_eq!(function.chars().last(), Some('\0'));
+ 
+     // Library names we will use are ASCII so we can use the A version to avoid string conversion.
+-    let module = unsafe { LoadLibraryA(library.as_ptr()) };
++    // Rune: load Windows system DLLs from System32 only, not the app directory or CWD.
++    let module = unsafe { LoadLibraryExA(library.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32) };
+     if module == 0 {
+         return None;
      }
-+
-+    #[inline]
-+    fn set_wake_on_wayland_read(&self, wake: bool) {
-+        self.p.set_wake_on_wayland_read(wake);
-+    }
- }
- 
- /// Additional methods on [`EventLoop`] that are specific to Wayland.
-diff --git a/src/platform_impl/linux/mod.rs b/src/platform_impl/linux/mod.rs
-index bc0e71c80..0071dfee2 100644
---- a/src/platform_impl/linux/mod.rs
-+++ b/src/platform_impl/linux/mod.rs
-@@ -869,6 +869,19 @@ impl ActiveEventLoop {
-         }
-     }
- 
-+    /// Rune: opt into waking from `ControlFlow::Wait` on any Wayland display read; no-op on X11.
-+    #[inline]
-+    pub fn set_wake_on_wayland_read(&self, wake: bool) {
-+        match *self {
-+            #[cfg(wayland_platform)]
-+            ActiveEventLoop::Wayland(ref evlp) => evlp.set_wake_on_wayland_read(wake),
-+            #[cfg(x11_platform)]
-+            ActiveEventLoop::X(_) => {
-+                let _ = wake;
-+            },
-+        }
-+    }
-+
-     pub fn create_custom_cursor(&self, cursor: CustomCursorSource) -> CustomCursor {
-         x11_or_wayland!(match self; ActiveEventLoop(evlp) => evlp.create_custom_cursor(cursor))
-     }
-diff --git a/src/platform_impl/linux/wayland/event_loop/mod.rs b/src/platform_impl/linux/wayland/event_loop/mod.rs
-index fef13f455..f73e50056 100644
---- a/src/platform_impl/linux/wayland/event_loop/mod.rs
-+++ b/src/platform_impl/linux/wayland/event_loop/mod.rs
-@@ -107,10 +107,12 @@ impl<T: 'static> EventLoop<T> {
-         let wayland_dispatcher =
-             calloop::Dispatcher::new(wayland_source, |_, queue, winit_state: &mut WinitState| {
-                 let result = queue.dispatch_pending(winit_state);
--                if result.is_ok()
--                    && (!winit_state.events_sink.is_empty()
--                        || !winit_state.window_compositor_updates.is_empty())
--                {
-+                if should_mark_dispatched(
-+                    result.is_ok(),
-+                    winit_state.wake_on_wayland_read,
-+                    !winit_state.events_sink.is_empty(),
-+                    !winit_state.window_compositor_updates.is_empty(),
-+                ) {
-                     winit_state.dispatched_events = true;
-                 }
-                 result
-@@ -656,6 +658,12 @@ pub struct ActiveEventLoop {
- }
- 
- impl ActiveEventLoop {
-+    /// Rune: opt into waking from `ControlFlow::Wait` on any Wayland display read.
-+    #[inline]
-+    pub(crate) fn set_wake_on_wayland_read(&self, wake: bool) {
-+        self.state.borrow_mut().wake_on_wayland_read = wake;
-+    }
-+
-     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
-         self.control_flow.set(control_flow)
-     }
-@@ -808,3 +816,32 @@ enum PumpEventNotifierAction {
-     /// Shutdown the thread.
-     Shutdown,
- }
-+
-+/// Rune: whether a completed Wayland source read should set `WinitState::dispatched_events`.
-+fn should_mark_dispatched(
-+    read_ok: bool,
-+    wake_on_wayland_read: bool,
-+    has_events: bool,
-+    has_compositor_updates: bool,
-+) -> bool {
-+    read_ok && (wake_on_wayland_read || has_events || has_compositor_updates)
-+}
-+
-+#[cfg(test)]
-+mod wake_on_wayland_read_tests {
-+    use super::should_mark_dispatched;
-+
-+    #[test]
-+    fn empty_sink_read_sets_dispatched_events_only_when_wake_flag_is_enabled() {
-+        // Default (flag off): empty-sink reads do not wake from ControlFlow::Wait.
-+        assert!(!should_mark_dispatched(true, false, false, false));
-+        // Flag on: a successful empty-sink read wakes the loop for foreign queues.
-+        assert!(should_mark_dispatched(true, true, false, false));
-+        // Dispatch errors never mark dispatched_events even with the flag on.
-+        assert!(!should_mark_dispatched(false, true, false, false));
-+        assert!(!should_mark_dispatched(false, false, true, true));
-+        // Non-empty winit sinks still wake when the flag is off.
-+        assert!(should_mark_dispatched(true, false, true, false));
-+        assert!(should_mark_dispatched(true, false, false, true));
-+    }
-+}
-diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
-index 27b73b6a4..eda2cea4b 100644
---- a/src/platform_impl/linux/wayland/state.rs
-+++ b/src/platform_impl/linux/wayland/state.rs
-@@ -115,6 +115,11 @@ pub struct WinitState {
-     /// Whether we have dispatched events to the user thus we want to
-     /// send `AboutToWait` and normally wakeup the user.
-     pub dispatched_events: bool,
-+
-+    /// Rune: when true, any successful Wayland display read marks `dispatched_events = true`
-+    /// even when winit's own event sinks are empty, so foreign queues sharing the display
-+    /// dispatch on that turn without background reader threads.
-+    pub wake_on_wayland_read: bool,
- }
- 
- impl WinitState {
-@@ -205,6 +210,7 @@ impl WinitState {
-             loop_handle,
-             // Make it true by default.
-             dispatched_events: true,
-+            wake_on_wayland_read: false,
-         })
-     }
- 
-diff --git a/src/platform_impl/windows/event_loop.rs b/src/platform_impl/windows/event_loop.rs
-index c386d644..a8181f95 100644
---- a/src/platform_impl/windows/event_loop.rs
-+++ b/src/platform_impl/windows/event_loop.rs
-@@ -1238,35 +1238,47 @@ unsafe fn public_window_callback_inner(
-         },
- 
-         WM_NCLBUTTONDOWN => {
--            if wparam == HTCAPTION as _ {
--                // Prevent the user event loop from pausing when left clicking the title bar.
--                //
--                // When the user interacts with the title bar, Windows enters the modal event
--                // loop. Currently, a left click causes a pause for about 500ms. Sending a dummy
--                // mouse-move event seems to cancel the modal loop early, preventing the pause.
--                // The application will never see this dummy event.
--                //
--                // The mouse coordinates are encoded into the lparam value, however the WM_MOUSEMOVE
--                // event is not using the same coordinate system of the WM_NCLBUTTONDOWN event.
--                // One uses client-area coordinates and the other is screen-coordinates. In any
--                // case, passing the lparam as-is with the dummy event does not seem the cancel
--                // the modal loop.
--                //
--                // However, passing in a value of 0 has been observed to always cancel the pause.
--                //
--                // Other notes:
--                //
--                // For some unknown reason, the cursor will blink when clicking the title bar.
--                // Cancelling the modal loop early causes the blink to happen *immediately*.
--                // Otherwise, the blank happens *after* the pause.
--                //
--                // When right-click the title bar, the system window menu is presented to the user,
--                // and the modal event loop begins. This dummy event does *not* prevent the freeze
--                // in the main event loop caused by that popup menu.
--                let lparam = 0;
--                unsafe { PostMessageW(window, WM_MOUSEMOVE, 0, lparam) };
-+            if userdata.window_state_lock().dragging {
-+                let res = unsafe { DefWindowProcW(window, msg, wparam, lparam) };
-+                let mut state = userdata.window_state_lock();
-+                if state.dragging {
-+                    state.dragging = false;
-+                    if !userdata.userdata_removed.get() {
-+                        unsafe { PostMessageW(window, WM_LBUTTONUP, 0, lparam) };
-+                    }
-+                }
-+                result = ProcResult::Value(res);
-+            } else {
-+                if wparam == HTCAPTION as _ {
-+                    // Prevent the user event loop from pausing when left clicking the title bar.
-+                    //
-+                    // When the user interacts with the title bar, Windows enters the modal event
-+                    // loop. Currently, a left click causes a pause for about 500ms. Sending a dummy
-+                    // mouse-move event seems to cancel the modal loop early, preventing the pause.
-+                    // The application will never see this dummy event.
-+                    //
-+                    // The mouse coordinates are encoded into the lparam value, however the WM_MOUSEMOVE
-+                    // event is not using the same coordinate system of the WM_NCLBUTTONDOWN event.
-+                    // One uses client-area coordinates and the other is screen-coordinates. In any
-+                    // case, passing the lparam as-is with the dummy event does not seem the cancel
-+                    // the modal loop.
-+                    //
-+                    // However, passing in a value of 0 has been observed to always cancel the pause.
-+                    //
-+                    // Other notes:
-+                    //
-+                    // For some unknown reason, the cursor will blink when clicking the title bar.
-+                    // Cancelling the modal loop early causes the blink to happen *immediately*.
-+                    // Otherwise, the blank happens *after* the pause.
-+                    //
-+                    // When right-click the title bar, the system window menu is presented to the user,
-+                    // and the modal event loop begins. This dummy event does *not* prevent the freeze
-+                    // in the main event loop caused by that popup menu.
-+                    let lparam = 0;
-+                    unsafe { PostMessageW(window, WM_MOUSEMOVE, 0, lparam) };
-+                }
-+                result = ProcResult::DefWindowProc(wparam);
-             }
--            result = ProcResult::DefWindowProc(wparam);
-         },
- 
-         WM_CLOSE => {
 diff --git a/src/platform_impl/windows/window.rs b/src/platform_impl/windows/window.rs
-index 1fcf1f2b..85dfb5e3 100644
+index 228c6f03e..85dfb5e32 100644
 --- a/src/platform_impl/windows/window.rs
 +++ b/src/platform_impl/windows/window.rs
 @@ -514,7 +514,7 @@ impl Window {
@@ -2089,7 +2703,67 @@ index 1fcf1f2b..85dfb5e3 100644
              };
          });
      }
-@@ -1595,3 +1595,30 @@ unsafe fn force_window_active(handle: HWND) {
+@@ -1246,7 +1246,12 @@ impl InitData<'_> {
+             unsafe { DeleteObject(region) };
+         }
+ 
+-        win.set_skip_taskbar(self.attributes.platform_specific.skip_taskbar);
++        // A new window is on the taskbar already: only taking it off needs the TaskbarList COM
++        // object (CoInitializeEx and CoCreateInstance on this thread, about 7,800 us and nine
++        // shell DLLs before the window's first frame).
++        if self.attributes.platform_specific.skip_taskbar {
++            win.set_skip_taskbar(true);
++        }
+         win.set_window_icon(self.attributes.window_icon.clone());
+         win.set_taskbar_icon(self.attributes.platform_specific.taskbar_icon.clone());
+ 
+@@ -1328,6 +1333,11 @@ unsafe fn init(
+     // Will be changed later using `window.set_enabled_buttons` but we need to set a default here
+     // so the diffing later can work.
+     window_flags.set(WindowFlags::CLOSABLE, true);
++    // The window is made with the boxes it asks for, so `set_enabled_buttons` in `on_create`
++    // changes nothing: adding them there rewrote its styles and changed its frame again
++    // (`SWP_FRAMECHANGED`, about 1,000 us before its first frame).
++    window_flags.set(WindowFlags::MINIMIZABLE, attributes.enabled_buttons.contains(WindowButtons::MINIMIZE));
++    window_flags.set(WindowFlags::MAXIMIZABLE, attributes.enabled_buttons.contains(WindowButtons::MAXIMIZE));
+     window_flags.set(WindowFlags::CLIP_CHILDREN, attributes.platform_specific.clip_children);
+ 
+     let mut fallback_parent = || match attributes.platform_specific.owner {
+@@ -1360,6 +1370,18 @@ unsafe fn init(
+     let menu = attributes.platform_specific.menu;
+     let fullscreen = attributes.fullscreen.clone();
+     let maximized = attributes.maximized;
++    // A window with a physical position is made there, at its size, so it is born on its
++    // display at that display's scale. Made at the default place (the primary display) and moved
++    // there afterwards, it would cross to the other display's scale (WM_DPICHANGED) and be
++    // resized to keep its logical size: a window saved on a 150 % display beside a 100 % primary
++    // would reopen half as large again.
++    let (x, y, width, height) = match (attributes.position, attributes.inner_size) {
++        (Some(Position::Physical(p)), Some(Size::Physical(s))) => {
++            (p.x, p.y, s.width as i32, s.height as i32)
++        },
++        (Some(Position::Physical(p)), _) => (p.x, p.y, CW_USEDEFAULT, CW_USEDEFAULT),
++        _ => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
++    };
+     let mut initdata = InitData { event_loop, attributes, window_flags, window: None };
+ 
+     let (style, ex_style) = window_flags.to_window_styles();
+@@ -1369,10 +1391,10 @@ unsafe fn init(
+             class_name.as_ptr(),
+             title.as_ptr(),
+             style,
+-            CW_USEDEFAULT,
+-            CW_USEDEFAULT,
+-            CW_USEDEFAULT,
+-            CW_USEDEFAULT,
++            x,
++            y,
++            width,
++            height,
+             parent.unwrap_or(0),
+             menu.unwrap_or(0),
+             util::get_instance_handle(),
+@@ -1573,3 +1595,30 @@ unsafe fn force_window_active(handle: HWND) {
  
      unsafe { SetForegroundWindow(handle) };
  }
@@ -2120,533 +2794,31 @@ index 1fcf1f2b..85dfb5e3 100644
 +        }
 +    }
 +}
-diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
---- a/src/platform_impl/linux/wayland/state.rs
-+++ b/src/platform_impl/linux/wayland/state.rs
-@@ -33,6 +33,7 @@ use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
- use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
- use crate::platform_impl::wayland::types::wp_viewporter::ViewporterState;
- use crate::platform_impl::wayland::types::xdg_activation::XdgActivationState;
-+use crate::platform_impl::wayland::types::xdg_toplevel_icon::XdgToplevelIconManagerState;
- use crate::platform_impl::wayland::window::{WindowRequests, WindowState};
- use crate::platform_impl::wayland::{WaylandError, WindowId};
- use crate::platform_impl::OsError;
-@@ -94,6 +95,9 @@ pub struct WinitState {
-     /// Xdg activation.
-     pub xdg_activation: Option<XdgActivationState>,
+diff --git a/src/platform_impl/windows/window_state.rs b/src/platform_impl/windows/window_state.rs
+index 8e24a4f25..bfe251b1c 100644
+--- a/src/platform_impl/windows/window_state.rs
++++ b/src/platform_impl/windows/window_state.rs
+@@ -380,7 +380,9 @@ impl WindowFlags {
+             diff.remove(WindowFlags::MINIMIZED);
+         }
  
-+    /// Xdg toplevel icon manager, for window icons.
-+    pub xdg_toplevel_icon_manager: Option<XdgToplevelIconManagerState>,
-+
-     /// Relative pointer.
-     pub relative_pointer: Option<RelativePointerState>,
+-        if diff.contains(WindowFlags::CLOSABLE) || new.contains(WindowFlags::CLOSABLE) {
++        // A new window's system menu has Close enabled: the menu (`GetSystemMenu` makes the
++        // window its own copy, about 1,200 us before its first frame) is touched only to change it.
++        if diff.contains(WindowFlags::CLOSABLE) && !(self.is_empty() && new.contains(WindowFlags::CLOSABLE)) {
+             let flags = MF_BYCOMMAND
+                 | if new.contains(WindowFlags::CLOSABLE) { MF_ENABLED } else { MF_DISABLED };
  
-@@ -187,6 +191,8 @@ impl WinitState {
+@@ -395,6 +397,12 @@ impl WindowFlags {
+             }
+         }
  
-             xdg_shell: XdgShell::bind(globals, queue_handle).map_err(WaylandError::Bind)?,
-             xdg_activation: XdgActivationState::bind(globals, queue_handle).ok(),
-+            xdg_toplevel_icon_manager: XdgToplevelIconManagerState::bind(globals, queue_handle)
-+                .ok(),
- 
-             windows: Default::default(),
-             window_requests: Default::default(),
-diff --git a/src/platform_impl/linux/wayland/types/mod.rs b/src/platform_impl/linux/wayland/types/mod.rs
---- a/src/platform_impl/linux/wayland/types/mod.rs
-+++ b/src/platform_impl/linux/wayland/types/mod.rs
-@@ -5,3 +5,4 @@ pub mod kwin_blur;
- pub mod wp_fractional_scaling;
- pub mod wp_viewporter;
- pub mod xdg_activation;
-+pub mod xdg_toplevel_icon;
-diff --git a/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs b/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs
-new file mode 100644
---- /dev/null
-+++ b/src/platform_impl/linux/wayland/types/xdg_toplevel_icon.rs
-@@ -0,0 +1,92 @@
-+//! Handling of xdg toplevel icons, the window's own icon (backport of rust-windowing/winit#4288).
-+
-+use sctk::globals::GlobalData;
-+use sctk::reexports::client::globals::{BindError, GlobalList};
-+use sctk::reexports::client::protocol::wl_shm::Format;
-+use sctk::reexports::client::{delegate_dispatch, Connection, Dispatch, Proxy, QueueHandle};
-+use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
-+use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_v1::XdgToplevelIconV1;
-+use sctk::shm::slot::{Buffer, CreateBufferError, SlotPool};
-+
-+use crate::platform_impl::wayland::state::WinitState;
-+use crate::platform_impl::PlatformIcon;
-+
-+#[derive(Debug)]
-+pub struct XdgToplevelIconManagerState {
-+    xdg_toplevel_icon_manager: XdgToplevelIconManagerV1,
-+}
-+
-+impl XdgToplevelIconManagerState {
-+    pub fn bind(
-+        globals: &GlobalList,
-+        queue_handle: &QueueHandle<WinitState>,
-+    ) -> Result<Self, BindError> {
-+        let xdg_toplevel_icon_manager = globals.bind(queue_handle, 1..=1, GlobalData)?;
-+        Ok(Self { xdg_toplevel_icon_manager })
-+    }
-+
-+    pub fn global(&self) -> &XdgToplevelIconManagerV1 {
-+        &self.xdg_toplevel_icon_manager
-+    }
-+}
-+
-+/// The window's icon in an shm buffer, kept alive while the toplevel shows it.
-+#[derive(Debug)]
-+pub struct ToplevelIcon {
-+    buffer: Buffer,
-+}
-+
-+impl ToplevelIcon {
-+    pub(crate) fn new(icon: &PlatformIcon, pool: &mut SlotPool) -> Result<Self, CreateBufferError> {
-+        let (width, height) = (icon.width as i32, icon.height as i32);
-+        let (buffer, canvas) = pool.create_buffer(width, height, 4 * width, Format::Argb8888)?;
-+        argb_premultiplied(&icon.rgba, canvas);
-+        Ok(Self { buffer })
-+    }
-+
-+    pub fn add_buffer(&self, xdg_toplevel_icon: &XdgToplevelIconV1) {
-+        xdg_toplevel_icon.add_buffer(self.buffer.wl_buffer(), 1);
-+    }
-+}
-+
-+/// Writes straight RGBA pixels as premultiplied little-endian ARGB8888.
-+fn argb_premultiplied(rgba: &[u8], canvas: &mut [u8]) {
-+    for (canvas_chunk, rgba) in canvas.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-+        let alpha = rgba[3] as f32 / 255.;
-+        let r = (rgba[0] as f32 * alpha) as u32;
-+        let g = (rgba[1] as f32 * alpha) as u32;
-+        let b = (rgba[2] as f32 * alpha) as u32;
-+        let color = ((rgba[3] as u32) << 24) + (r << 16) + (g << 8) + b;
-+        let array: &mut [u8; 4] = canvas_chunk.try_into().unwrap();
-+        *array = color.to_le_bytes();
-+    }
-+}
-+
-+impl Dispatch<XdgToplevelIconManagerV1, GlobalData, WinitState> for XdgToplevelIconManagerState {
-+    fn event(
-+        _state: &mut WinitState,
-+        _proxy: &XdgToplevelIconManagerV1,
-+        _event: <XdgToplevelIconManagerV1 as Proxy>::Event,
-+        _data: &GlobalData,
-+        _conn: &Connection,
-+        _qhandle: &QueueHandle<WinitState>,
-+    ) {
-+        // Preferred icon sizes: one buffer is enough, the compositor scales it.
-+    }
-+}
-+
-+impl Dispatch<XdgToplevelIconV1, GlobalData, WinitState> for XdgToplevelIconManagerState {
-+    fn event(
-+        _state: &mut WinitState,
-+        _proxy: &XdgToplevelIconV1,
-+        _event: <XdgToplevelIconV1 as Proxy>::Event,
-+        _data: &GlobalData,
-+        _conn: &Connection,
-+        _qhandle: &QueueHandle<WinitState>,
-+    ) {
-+        // No events.
-+    }
-+}
-+
-+delegate_dispatch!(WinitState: [XdgToplevelIconManagerV1: GlobalData] => XdgToplevelIconManagerState);
-+delegate_dispatch!(WinitState: [XdgToplevelIconV1: GlobalData] => XdgToplevelIconManagerState);
-diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
---- a/src/platform_impl/linux/wayland/window/mod.rs
-+++ b/src/platform_impl/linux/wayland/window/mod.rs
-@@ -132,6 +132,9 @@ impl Window {
-         // Set the window title.
-         window_state.set_title(attributes.title);
- 
-+        // Set the window icon before the first commit.
-+        window_state.set_window_icon(attributes.window_icon.map(|icon| icon.inner));
-+
-         // Set the min and max sizes. We must set the hints upon creating a window, so
-         // we use the default `1.` scaling...
-         let min_size = attributes.min_inner_size.map(|size| size.to_logical(1.));
-@@ -442,7 +445,9 @@ impl Window {
-     pub fn set_window_level(&self, _level: WindowLevel) {}
- 
-     #[inline]
--    pub(crate) fn set_window_icon(&self, _window_icon: Option<PlatformIcon>) {}
-+    pub(crate) fn set_window_icon(&self, window_icon: Option<PlatformIcon>) {
-+        self.window_state.lock().unwrap().set_window_icon(window_icon);
-+    }
- 
-     #[inline]
-     pub fn set_minimized(&self, minimized: bool) {
-diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
---- a/src/platform_impl/linux/wayland/window/state.rs
-+++ b/src/platform_impl/linux/wayland/window/state.rs
-@@ -19,8 +19,10 @@ use sctk::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_
- use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
- use sctk::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
- use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
-+use sctk::reexports::protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
- 
- use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
-+use sctk::globals::GlobalData;
- use sctk::seat::pointer::{PointerDataExt, ThemedPointer};
- use sctk::shell::xdg::window::{DecorationMode, Window, WindowConfigure};
- use sctk::shell::xdg::XdgSurface;
-@@ -36,7 +38,8 @@ use crate::error::{ExternalError, NotSupportedError};
- use crate::platform_impl::wayland::logical_to_physical_rounded;
- use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
- use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
--use crate::platform_impl::{PlatformCustomCursor, WindowId};
-+use crate::platform_impl::wayland::types::xdg_toplevel_icon::ToplevelIcon;
-+use crate::platform_impl::{PlatformCustomCursor, PlatformIcon, WindowId};
- use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
- 
- use crate::platform_impl::wayland::seat::{
-@@ -63,6 +66,12 @@ pub struct WindowState {
-     // A shared pool where to allocate custom cursors.
-     custom_cursor_pool: Arc<Mutex<SlotPool>>,
- 
-+    /// Xdg toplevel icon manager, to set the window's icon.
-+    xdg_toplevel_icon_manager: Option<XdgToplevelIconManagerV1>,
-+
-+    /// The window's current icon, whose buffer the compositor may still read.
-+    toplevel_icon: Option<ToplevelIcon>,
-+
-     /// The last received configure.
-     pub last_configure: Option<WindowConfigure>,
- 
-@@ -185,8 +194,12 @@ impl WindowState {
-             .fractional_scaling_manager
-             .as_ref()
-             .map(|fsm| fsm.fractional_scaling(window.wl_surface(), queue_handle));
-+        let xdg_toplevel_icon_manager =
-+            winit_state.xdg_toplevel_icon_manager.as_ref().map(|manager| manager.global().clone());
- 
-         Self {
-+            toplevel_icon: None,
-+            xdg_toplevel_icon_manager,
-             blur: None,
-             blur_manager: winit_state.kwin_blur_manager.clone(),
-             compositor,
-@@ -1183,6 +1196,41 @@ impl WindowState {
-         self.title = title;
-     }
- 
-+    /// Set the window's icon through `xdg_toplevel_icon_v1`, when the compositor has it.
-+    pub(crate) fn set_window_icon(&mut self, window_icon: Option<PlatformIcon>) {
-+        let Some(manager) = self.xdg_toplevel_icon_manager.as_ref() else {
-+            if window_icon.is_some() {
-+                info!("`xdg_toplevel_icon_manager_v1` is not supported");
-+            }
++        // A show or a hide alone: ShowWindow set WS_VISIBLE itself. Writing the styles again and
++        // refreshing the frame (SWP_FRAMECHANGED) cost a window's first show about 2,200 us.
++        if diff == WindowFlags::VISIBLE {
 +            return;
-+        };
-+
-+        let (toplevel_icon, xdg_toplevel_icon) = match window_icon {
-+            Some(icon) => {
-+                let mut pool = self.custom_cursor_pool.lock().unwrap();
-+                let toplevel_icon = match ToplevelIcon::new(&icon, &mut pool) {
-+                    Ok(toplevel_icon) => toplevel_icon,
-+                    Err(error) => {
-+                        warn!("Error setting window icon: {error}");
-+                        return;
-+                    },
-+                };
-+                let xdg_toplevel_icon = manager.create_icon(&self.queue_handle, GlobalData);
-+                toplevel_icon.add_buffer(&xdg_toplevel_icon);
-+                (Some(toplevel_icon), Some(xdg_toplevel_icon))
-+            },
-+            None => (None, None),
-+        };
-+
-+        manager.set_icon(self.window.xdg_toplevel(), xdg_toplevel_icon.as_ref());
-+        self.toplevel_icon = toplevel_icon;
-+
-+        // The icon object is immutable once set; the toplevel keeps what it showed.
-+        if let Some(xdg_toplevel_icon) = xdg_toplevel_icon {
-+            xdg_toplevel_icon.destroy();
 +        }
-+    }
 +
-     /// Mark the window as transparent.
-     #[inline]
-     pub fn set_transparent(&mut self, transparent: bool) {
-diff --git a/src/platform/wayland.rs b/src/platform/wayland.rs
-index 7b22e69f0..fb28071f2 100644
---- a/src/platform/wayland.rs
-+++ b/src/platform/wayland.rs
-@@ -109,6 +109,13 @@ pub trait WindowExtWayland {
-     /// False when the compositor draws the decorations, when decorations are off, when no frame
-     /// could be made, and on X11.
-     fn has_client_side_frame(&self) -> bool;
-+
-+    /// Rune: confirmed Wayland `xdg_toplevel` / `xdg-decoration` state from the latest configure:
-+    /// `(is_server_decoration, tiled_edges [top, right, bottom, left], wm_capabilities bits)`.
-+    ///
-+    /// Returns `None` before the initial configure and on X11. `tiled_edges` is `None` below
-+    /// `xdg_toplevel` v2 and `wm_capabilities` is `None` below v5.
-+    fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)>;
- }
+         if diff != WindowFlags::empty() {
+             let (style, style_ex) = new.to_window_styles();
  
- impl WindowExtWayland for Window {
-@@ -144,6 +151,17 @@ impl WindowExtWayland for Window {
-             crate::platform_impl::Window::Wayland(window) => window.has_client_side_frame(),
-         }
-     }
-+
-+    #[inline]
-+    fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
-+        #[allow(clippy::single_match)]
-+        match &self.window {
-+            #[cfg(x11_platform)]
-+            crate::platform_impl::Window::X(_) => None,
-+            #[cfg(wayland_platform)]
-+            crate::platform_impl::Window::Wayland(window) => window.wayland_wm_state(),
-+        }
-+    }
- }
- 
- /// Additional methods on [`WindowAttributes`] that are specific to Wayland.
-diff --git a/src/platform/x11.rs b/src/platform/x11.rs
-index 4ab900c94..416c6dc20 100644
---- a/src/platform/x11.rs
-+++ b/src/platform/x11.rs
-@@ -137,9 +137,25 @@ impl<T> EventLoopBuilderExtX11 for EventLoopBuilder<T> {
- }
- 
- /// Additional methods on [`Window`] that are specific to X11.
--pub trait WindowExtX11 {}
-+pub trait WindowExtX11 {
-+    /// Rune: returns and clears whether an EWMH/GTK window-manager property (`_NET_WM_STATE`,
-+    /// `_NET_WM_ALLOWED_ACTIONS`, `_GTK_EDGE_CONSTRAINTS`, or `_NET_FRAME_EXTENTS`) changed on
-+    /// this window since the last call. Always `false` on Wayland.
-+    fn take_wm_state_changed(&self) -> bool;
-+}
- 
--impl WindowExtX11 for Window {}
-+impl WindowExtX11 for Window {
-+    #[inline]
-+    fn take_wm_state_changed(&self) -> bool {
-+        #[allow(clippy::single_match)]
-+        match &self.window {
-+            #[cfg(x11_platform)]
-+            crate::platform_impl::Window::X(window) => window.take_wm_state_changed(),
-+            #[cfg(wayland_platform)]
-+            crate::platform_impl::Window::Wayland(_) => false,
-+        }
-+    }
-+}
- 
- /// Additional methods on [`WindowAttributes`] that are specific to X11.
- pub trait WindowAttributesExtX11 {
-diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
-index 428449df4..d37580a1d 100644
---- a/src/platform_impl/linux/wayland/window/mod.rs
-+++ b/src/platform_impl/linux/wayland/window/mod.rs
-@@ -441,6 +441,12 @@ impl Window {
-         self.window_state.lock().unwrap().has_client_side_frame()
-     }
- 
-+    /// Rune: see `WindowExtWayland::wayland_wm_state`.
-+    #[inline]
-+    pub fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
-+        self.window_state.lock().unwrap().wayland_wm_state()
-+    }
-+
-     #[inline]
-     pub fn set_window_level(&self, _level: WindowLevel) {}
- 
-diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
-index f0b5936ef..6714852de 100644
---- a/src/platform_impl/linux/wayland/window/state.rs
-+++ b/src/platform_impl/linux/wayland/window/state.rs
-@@ -419,6 +419,9 @@ impl WindowState {
- 
-         let new_state = configure.state;
-         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
-+        let old_decoration_mode =
-+            self.last_configure.as_ref().map(|configure| configure.decoration_mode);
-+        let old_capabilities = self.last_configure.as_ref().map(|configure| configure.capabilities);
- 
-         let state_change_requires_resize = old_state
-             .map(|old_state| {
-@@ -426,6 +429,8 @@ impl WindowState {
-                     .symmetric_difference(new_state)
-                     .difference(XdgWindowState::ACTIVATED | XdgWindowState::SUSPENDED)
-                     .is_empty()
-+                    || old_decoration_mode != Some(configure.decoration_mode)
-+                    || old_capabilities != Some(configure.capabilities)
-             })
-             // NOTE: `None` is present for the initial configure, thus we must always resize.
-             .unwrap_or(true);
-@@ -650,6 +655,26 @@ impl WindowState {
-             && self.frame.is_some()
-     }
- 
-+    /// Rune: confirmed Wayland `xdg_toplevel` / `xdg-decoration` state from `last_configure`,
-+    /// gated by `xdg_toplevel` protocol version (`>= 2` for tiled edges, `>= 5` for
-+    /// `wm_capabilities`).
-+    #[inline]
-+    pub fn wayland_wm_state(&self) -> Option<(bool, Option<[bool; 4]>, Option<u16>)> {
-+        let configure = self.last_configure.as_ref()?;
-+        let server = matches!(configure.decoration_mode, DecorationMode::Server);
-+        let version = self.window.xdg_toplevel().version();
-+        let tiled = (version >= 2).then(|| {
-+            [
-+                configure.is_tiled_top(),
-+                configure.is_tiled_right(),
-+                configure.is_tiled_bottom(),
-+                configure.is_tiled_left(),
-+            ]
-+        });
-+        let capabilities = (version >= 5).then(|| configure.capabilities.bits());
-+        Some((server, tiled, capabilities))
-+    }
-+
-     /// Rune: the radius, in logical points, of the arc the window's content takes at its bottom
-     /// corners, which the client-side frame leaves it (the frame's visible border lies just
-     /// outside it). Zero when no client-side frame is drawn, and when the frame draws the window
-diff --git a/src/platform_impl/linux/x11/atoms.rs b/src/platform_impl/linux/x11/atoms.rs
-index c6d96c8fe..cc6248e75 100644
---- a/src/platform_impl/linux/x11/atoms.rs
-+++ b/src/platform_impl/linux/x11/atoms.rs
-@@ -93,7 +93,9 @@ atom_manager! {
-     None: b"None",
- 
-     // Miscellaneous Atoms
-+    _GTK_EDGE_CONSTRAINTS,
-     _GTK_THEME_VARIANT,
-+    _NET_WM_ALLOWED_ACTIONS,
-     _MOTIF_WM_HINTS,
-     _NET_ACTIVE_WINDOW,
-     _NET_CLIENT_LIST,
-diff --git a/src/platform_impl/linux/x11/event_processor.rs b/src/platform_impl/linux/x11/event_processor.rs
-index 79f5c114f..ce78af014 100644
---- a/src/platform_impl/linux/x11/event_processor.rs
-+++ b/src/platform_impl/linux/x11/event_processor.rs
-@@ -857,6 +857,18 @@ impl EventProcessor {
-             || atom == atoms[_XSETTINGS_SETTINGS]
-         {
-             self.process_dpi_change(&mut callback);
-+        } else if atom == atoms[_NET_WM_STATE]
-+            || atom == atoms[_NET_WM_ALLOWED_ACTIONS]
-+            || atom == atoms[_GTK_EDGE_CONSTRAINTS]
-+            || atom == atoms[_NET_FRAME_EXTENTS]
-+        {
-+            let xwindow = xev.window as xproto::Window;
-+            if self.with_window(xwindow, |window| window.mark_wm_state_changed()).is_some() {
-+                callback(&self.target, Event::WindowEvent {
-+                    window_id: mkwid(xwindow),
-+                    event: WindowEvent::RedrawRequested,
-+                });
-+            }
-         }
-     }
- 
-diff --git a/src/platform_impl/linux/x11/window.rs b/src/platform_impl/linux/x11/window.rs
-index 7e15d5f24..3cdcecfd3 100644
---- a/src/platform_impl/linux/x11/window.rs
-+++ b/src/platform_impl/linux/x11/window.rs
-@@ -2,6 +2,7 @@ use std::ffi::CString;
- use std::mem::replace;
- use std::os::raw::*;
- use std::path::Path;
-+use std::sync::atomic::{AtomicBool, Ordering};
- use std::sync::{Arc, Mutex, MutexGuard};
- use std::{cmp, env};
- 
-@@ -124,6 +125,7 @@ pub struct UnownedWindow {
-     pub shared_state: Mutex<SharedState>,
-     redraw_sender: WakeSender<WindowId>,
-     activation_sender: WakeSender<super::ActivationToken>,
-+    wm_state_changed: AtomicBool,
- }
- 
- macro_rules! leap {
-@@ -351,6 +353,7 @@ impl UnownedWindow {
-             shared_state: SharedState::new(guessed_monitor, &window_attrs),
-             redraw_sender: event_loop.redraw_sender.clone(),
-             activation_sender: event_loop.activation_sender.clone(),
-+            wm_state_changed: AtomicBool::new(false),
-         };
- 
-         // Title must be set before mapping. Some tiling window managers (i.e. i3) use the window
-@@ -826,6 +829,19 @@ impl UnownedWindow {
-         }
-     }
- 
-+    /// Rune: records that an EWMH/GTK window-manager property changed on this window.
-+    #[inline]
-+    pub(crate) fn mark_wm_state_changed(&self) {
-+        self.wm_state_changed.store(true, Ordering::Release);
-+    }
-+
-+    /// Rune: returns and clears whether an EWMH/GTK window-manager property changed since
-+    /// the last check (`WindowExtX11::take_wm_state_changed`).
-+    #[inline]
-+    pub fn take_wm_state_changed(&self) -> bool {
-+        self.wm_state_changed.swap(false, Ordering::AcqRel)
-+    }
-+
-     // Called by EventProcessor when a VisibilityNotify event is received
-     pub(crate) fn visibility_notify(&self) {
-         let mut shared_state = self.shared_state_lock();
-diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
-index 8b1ccc364..942b78512 100644
---- a/src/platform_impl/linux/wayland/state.rs
-+++ b/src/platform_impl/linux/wayland/state.rs
-@@ -338,6 +338,8 @@ impl OutputHandler for WinitState {
- 
-     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-         self.monitors.lock().unwrap().push(MonitorHandle::new(output));
-+        // Rune: wake `AboutToWait` in case `wl_surface.enter` arrived before `wl_output.done`.
-+        self.dispatched_events = true;
-     }
- 
-     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, updated: WlOutput) {
-@@ -355,6 +357,8 @@ impl OutputHandler for WinitState {
-         let removed = MonitorHandle::new(removed);
-         if let Some(pos) = monitors.iter().position(|output| output == &removed) {
-             monitors.remove(pos);
-+            // Rune: wake `AboutToWait` even when the compositor sent no `wl_surface.leave`.
-+            self.dispatched_events = true;
-         }
-     }
- }
-@@ -377,6 +381,8 @@ impl CompositorHandler for WinitState {
-         _: &WlSurface,
-         _: &WlOutput,
-     ) {
-+        // Rune: wake `AboutToWait` so output-presence hooks see entry at scale 1 without resize.
-+        self.dispatched_events = true;
-     }
- 
-     fn surface_leave(
-@@ -386,6 +392,8 @@ impl CompositorHandler for WinitState {
-         _: &WlSurface,
-         _: &WlOutput,
-     ) {
-+        // Rune: wake `AboutToWait` so output-presence hooks see leave without resize.
-+        self.dispatched_events = true;
-     }
- 
-     fn scale_factor_changed(
-diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
-index d37580a1d..91583669e 100644
---- a/src/platform_impl/linux/wayland/window/mod.rs
-+++ b/src/platform_impl/linux/wayland/window/mod.rs
-@@ -659,7 +659,13 @@ impl Window {
-     #[inline]
-     pub fn current_monitor(&self) -> Option<MonitorHandle> {
-         let data = self.window.wl_surface().data::<SurfaceData>()?;
--        data.outputs().next().map(MonitorHandle::new)
-+        // Rune: compositors like Sway may destroy a `wl_output` global without sending
-+        // `wl_surface.leave`, leaving a dead output at index 0 of `SurfaceData::outputs`.
-+        // Skip removed outputs so `current_monitor` returns `None` or the next live output.
-+        let monitors = self.monitors.lock().unwrap();
-+        data.outputs()
-+            .find(|output| monitors.iter().any(|m| m.proxy == *output))
-+            .map(MonitorHandle::new)
-     }
- 
-     #[inline]
